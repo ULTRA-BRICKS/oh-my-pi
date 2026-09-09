@@ -1197,6 +1197,10 @@ export interface RegisteredCommand {
 	name: string;
 	description?: string;
 	getArgumentCompletions?: (argumentPrefix: string) => AutocompleteItem[] | null;
+	/** Inline ghost-hint text for the current argument state, shown after the cursor in the TUI editor. */
+	getInlineHint?: (argumentText: string) => string | null;
+	/** Dynamic display-only description for slash-command autocomplete. Must be synchronous and side-effect free. */
+	getAutocompleteDescription?: () => string | undefined;
 	handler: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
 }
 
@@ -1373,6 +1377,8 @@ export interface ExtensionAPI {
 		options: {
 			description?: string;
 			getArgumentCompletions?: RegisteredCommand["getArgumentCompletions"];
+			getInlineHint?: RegisteredCommand["getInlineHint"];
+			getAutocompleteDescription?: RegisteredCommand["getAutocompleteDescription"];
 			handler: RegisteredCommand["handler"];
 		},
 	): void;

@@ -6,6 +6,10 @@
 
 - `/session pin <account> --exclusive` reserves a stored OAuth account for the current session only — other sessions exclude it from rotation, and this session surfaces an explicit error instead of silently switching accounts when the pinned account is unavailable. `/session unpin` releases the pin and returns the account to the shared pool; exclusive pins are recorded in the session file and re-asserted on resume.
 
+### Added
+
+- Extension commands registered via `pi.registerCommand` now accept optional `getInlineHint` and `getAutocompleteDescription` callbacks, giving extension commands the same argument ghost-hint and live autocomplete description as builtin commands.
+
 ## [18.1.16] - 2026-09-09
 
 ### Added
