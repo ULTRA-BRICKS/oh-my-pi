@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Extension commands registered via `pi.registerCommand` now accept optional `getInlineHint` and `getAutocompleteDescription` callbacks, giving extension commands the same argument ghost-hint and live autocomplete description as builtin commands.
+
 ## [18.1.16] - 2026-09-09
 
 ### Added

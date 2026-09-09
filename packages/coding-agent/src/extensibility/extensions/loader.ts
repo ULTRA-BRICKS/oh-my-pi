@@ -199,6 +199,8 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 		options: {
 			description?: string;
 			getArgumentCompletions?: RegisteredCommand["getArgumentCompletions"];
+			getInlineHint?: RegisteredCommand["getInlineHint"];
+			getAutocompleteDescription?: RegisteredCommand["getAutocompleteDescription"];
 			handler: RegisteredCommand["handler"];
 		},
 	): void {

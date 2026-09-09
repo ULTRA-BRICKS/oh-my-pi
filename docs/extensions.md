@@ -270,6 +270,35 @@ Command handlers additionally get:
 
 Use command context for session-control flows; these methods are intentionally separated from general event handlers.
 
+### Slash command TUI affordances
+
+`pi.registerCommand` accepts the same optional interactive-mode callbacks builtin slash commands use:
+
+- `getArgumentCompletions(argumentPrefix)` — tab-completion items for the argument under the cursor
+- `getInlineHint(argumentText)` — inline ghost hint rendered after the cursor while the user types arguments
+- `getAutocompleteDescription()` — dynamic description shown in the slash-command autocomplete list
+
+These callbacks are wired only when extension commands are adapted for the interactive TUI (`extensionCommandToSlashCommand` in `interactive-mode.ts`). ACP/RPC dispatch paths consume command metadata and handlers only; they are unaffected by hint callbacks.
+
+```ts
+pi.registerCommand("accounts", {
+  description: "Manage OAuth accounts",
+  getArgumentCompletions: completeAccountsArgument,
+  getInlineHint: (argumentText) => {
+    const space = argumentText.indexOf(" ");
+    const sub = (space === -1 ? argumentText : argumentText.slice(0, space)).toLowerCase();
+    const rest = space === -1 ? "" : argumentText.slice(space + 1);
+    if (!sub) return "<subcommand>";
+    if (sub === "list" && !rest) return "[provider]";
+    return null;
+  },
+  getAutocompleteDescription: () => `${accountCount} OAuth accounts`,
+  handler: async (args, ctx) => {
+    /* ... */
+  },
+});
+```
+
 ## Event surface (current names and behavior)
 
 Canonical event unions and payload types are in `types.ts`.

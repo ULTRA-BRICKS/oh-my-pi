@@ -78,7 +78,7 @@ import type {
 	ExtensionWidgetContent,
 	ExtensionWidgetOptions,
 } from "../extensibility/extensions";
-import type { CompactOptions } from "../extensibility/extensions/types";
+import type { CompactOptions, RegisteredCommand } from "../extensibility/extensions/types";
 import type { Skill } from "../extensibility/skills";
 import type { FileSlashCommand } from "../extensibility/slash-commands";
 import { loadSlashCommands } from "../extensibility/slash-commands";
@@ -595,6 +595,23 @@ export function renderSubagentHudLines(sessions: ObservableSession[], columns: n
 
 const CTRL_L_APPEARANCE_RESPONSE_DEADLINE_MS = 2000;
 
+/**
+ * Adapt an extension-registered command into the TUI slash-command shape.
+ * The optional inline-hint and autocomplete-description callbacks pass
+ * through unchanged, so extension commands get the same ghost-hint and live
+ * description affordances as builtin commands.
+ */
+export function extensionCommandToSlashCommand(cmd: RegisteredCommand): SlashCommand {
+	return {
+		name: cmd.name,
+		description: cmd.description ?? "(hook command)",
+		icon: getSlashCommandTypeIcon("extension"),
+		getArgumentCompletions: cmd.getArgumentCompletions,
+		getInlineHint: cmd.getInlineHint,
+		getAutocompleteDescription: cmd.getAutocompleteDescription,
+	};
+}
+
 export class InteractiveMode implements InteractiveModeContext {
 	#ownsStartedUi: boolean;
 	session: AgentSession;
@@ -1067,12 +1084,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		const hookCommands: SlashCommand[] = (
 			this.session.extensionRunner?.getRegisteredCommands(BUILTIN_SLASH_COMMAND_RESERVED_NAMES) ?? []
-		).map(cmd => ({
-			name: cmd.name,
-			description: cmd.description ?? "(hook command)",
-			icon: getSlashCommandTypeIcon("extension"),
-			getArgumentCompletions: cmd.getArgumentCompletions,
-		}));
+		).map(extensionCommandToSlashCommand);
 
 		// Convert custom commands (TypeScript) to SlashCommand format
 		const customCommands: SlashCommand[] = this.session.customCommands.map(loaded => ({
