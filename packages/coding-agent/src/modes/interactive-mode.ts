@@ -1072,6 +1072,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			description: cmd.description ?? "(hook command)",
 			icon: getSlashCommandTypeIcon("extension"),
 			getArgumentCompletions: cmd.getArgumentCompletions,
+			getInlineHint: cmd.getInlineHint,
 		}));
 
 		// Convert custom commands (TypeScript) to SlashCommand format

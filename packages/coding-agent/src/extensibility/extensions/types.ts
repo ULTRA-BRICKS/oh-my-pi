@@ -1197,6 +1197,7 @@ export interface RegisteredCommand {
 	name: string;
 	description?: string;
 	getArgumentCompletions?: (argumentPrefix: string) => AutocompleteItem[] | null;
+	getInlineHint?: (argumentText: string) => string | null;
 	handler: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
 }
 
@@ -1373,6 +1374,7 @@ export interface ExtensionAPI {
 		options: {
 			description?: string;
 			getArgumentCompletions?: RegisteredCommand["getArgumentCompletions"];
+			getInlineHint?: RegisteredCommand["getInlineHint"];
 			handler: RegisteredCommand["handler"];
 		},
 	): void;
