@@ -496,6 +496,62 @@ describe("Editor component", () => {
 			expect(editor.isShowingAutocomplete()).toBe(false);
 		});
 
+		it("chains into nested argument completions after tab-completing slash command subcommands", async () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setAutocompleteProvider(
+				new CombinedAutocompleteProvider(
+					[
+						{
+							name: "accounts",
+							description: "Manage accounts",
+							getArgumentCompletions(argumentPrefix: string) {
+								const trimmed = argumentPrefix.trim();
+								if (!trimmed || !trimmed.includes(" ")) {
+									return [
+										{ label: "rotation", value: "rotation " },
+										{ label: "list", value: "list " },
+									];
+								}
+								if (trimmed.startsWith("rotation")) {
+									return [
+										{ label: "default", value: "default" },
+										{ label: "smart", value: "smart" },
+										{ label: "status", value: "status" },
+									];
+								}
+								return null;
+							},
+						},
+					],
+					"/tmp",
+				),
+			);
+
+			editor.handleInput("/");
+			await Bun.sleep(0);
+			editor.handleInput("a");
+			editor.handleInput("c");
+			editor.handleInput("c");
+			await Bun.sleep(110);
+
+			editor.handleInput("	");
+			await Bun.sleep(0);
+
+			expect(editor.getText()).toBe("/accounts ");
+			expect(editor.isShowingAutocomplete()).toBe(true);
+
+			editor.handleInput("r");
+			editor.handleInput("o");
+			editor.handleInput("t");
+			await Bun.sleep(110);
+
+			editor.handleInput("	");
+			await Bun.sleep(0);
+
+			expect(editor.getText()).toBe("/accounts rotation ");
+			expect(editor.isShowingAutocomplete()).toBe(true);
+		});
+
 		it("does not show argument completions when command has no argument completer", async () => {
 			const editor = new Editor(defaultEditorTheme);
 			editor.setAutocompleteProvider(

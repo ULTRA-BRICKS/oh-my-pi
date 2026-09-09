@@ -1491,7 +1491,7 @@ export class Editor implements Component, Focusable {
 
 						result.onApplied?.();
 
-						if (shouldChainAutocomplete) {
+						if (shouldChainAutocomplete || this.#shouldChainSlashCommandArgumentAutocomplete()) {
 							queueMicrotask(() => void this.#tryTriggerAutocomplete());
 						}
 					}
@@ -1568,7 +1568,10 @@ export class Editor implements Component, Focusable {
 							result.onApplied?.();
 							if (shouldChainDirectoryCompletion) {
 								queueMicrotask(() => void this.#tryTriggerAutocomplete());
-							} else if (shouldChainSlashCommandAutocomplete && this.#isCompletedSlashCommandAtCursor()) {
+							} else if (
+								this.#shouldChainSlashCommandArgumentAutocomplete() ||
+								(shouldChainSlashCommandAutocomplete && this.#isCompletedSlashCommandAtCursor())
+							) {
 								void this.#tryTriggerAutocomplete();
 							}
 						}
@@ -3416,6 +3419,18 @@ export class Editor implements Component, Focusable {
 		return (
 			this.#isInSubmittedSlashCommandContext() && textBeforeCursor.startsWith("/") && !textBeforeCursor.includes(" ")
 		);
+	}
+
+
+	/** After accepting a slash-command argument completion, chain into the next argument level. */
+	#shouldChainSlashCommandArgumentAutocomplete(): boolean {
+		if (!this.#isInSubmittedSlashCommandContext()) {
+			return false;
+		}
+
+		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
+		const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol).trimStart();
+		return /^\/\S+\s/.test(textBeforeCursor);
 	}
 
 	#isCompletedSlashCommandAtCursor(): boolean {
