@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { buildManagedKernelEnv } from "../src/eval/executor-base";
+import { buildManagedKernelEnv, buildManagedKernelEnvPatch } from "../src/eval/executor-base";
 import { buildHookIdentityEnv, mergeHookIdentityEnv } from "../src/hook-identity-env";
 
 describe("hook-identity-env", () => {
@@ -34,5 +34,11 @@ describe("hook-identity-env", () => {
 			RIG_AGENT_ID: "Worker",
 		});
 	});
+	it("buildManagedKernelEnvPatch clears RIG_AGENT_ID on null agentId", () => {
+		expect(buildManagedKernelEnvPatch({ agentId: "Worker" }).RIG_AGENT_ID).toBe("Worker");
+		expect(buildManagedKernelEnvPatch({ agentId: undefined }).RIG_AGENT_ID).toBeNull();
+		expect(buildManagedKernelEnvPatch({ agentId: undefined }, { sparse: true })).not.toHaveProperty(
+			"RIG_AGENT_ID",
+		);
+	});
 });
-

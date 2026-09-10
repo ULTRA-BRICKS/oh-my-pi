@@ -8,6 +8,7 @@ import * as util from "node:util";
 
 import * as logger from "@oh-my-pi/pi-utils/logger";
 
+import { buildHookIdentityEnv, HOOK_IDENTITY_ENV_KEYS, type HookIdentityEnvInput } from "../../../hook-identity-env";
 import type { EvalPreludeSource } from "../worker-protocol";
 import { createHelpers, type HelperBundle } from "./helpers";
 import { awaitMaybePromise, indirectEval } from "./indirect-eval";
@@ -222,6 +223,17 @@ export class JsRuntime {
 
 	get cwd(): string {
 		return this.#cwd;
+	}
+
+	/** Sync trusted hook-identity markers into the runtime env map. */
+	syncHookIdentityEnv(input: HookIdentityEnvInput): void {
+		if (this.#disposed) throw new Error("Cannot sync hook identity on a disposed JS runtime");
+		const patch = buildHookIdentityEnv(input);
+		for (const key of HOOK_IDENTITY_ENV_KEYS) {
+			const value = patch[key];
+			if (value !== undefined) this.#env.set(key, value);
+			else this.#env.delete(key);
+		}
 	}
 
 	setCwd(cwd: string): void {
