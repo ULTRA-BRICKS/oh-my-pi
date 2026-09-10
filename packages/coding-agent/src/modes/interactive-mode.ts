@@ -595,11 +595,47 @@ export function renderSubagentHudLines(sessions: ObservableSession[], columns: n
 
 const CTRL_L_APPEARANCE_RESPONSE_DEADLINE_MS = 2000;
 
+function sanitizeExtensionInlineHint(value: string | null): string | null {
+	if (value === null) return null;
+	const sanitized = sanitizeStatusText(value);
+	return sanitized.length > 0 ? sanitized : null;
+}
+
+function sanitizeExtensionAutocompleteDescription(value: string | undefined): string | undefined {
+	if (value === undefined) return undefined;
+	const sanitized = sanitizeStatusText(value);
+	return sanitized.length > 0 ? sanitized : undefined;
+}
+
+function wrapExtensionInlineHint(
+	fn: (argumentText: string) => string | null,
+): (argumentText: string) => string | null {
+	return (argumentText: string) => {
+		try {
+			return sanitizeExtensionInlineHint(fn(argumentText));
+		} catch {
+			return null;
+		}
+	};
+}
+
+function wrapExtensionAutocompleteDescription(
+	fn: () => string | undefined,
+): () => string | undefined {
+	return () => {
+		try {
+			return sanitizeExtensionAutocompleteDescription(fn());
+		} catch {
+			return undefined;
+		}
+	};
+}
+
 /**
  * Adapt an extension-registered command into the TUI slash-command shape.
- * The optional inline-hint and autocomplete-description callbacks pass
- * through unchanged, so extension commands get the same ghost-hint and live
- * description affordances as builtin commands.
+ * Optional inline-hint and autocomplete-description callbacks are wrapped so
+ * extension output is single-line safe for the TUI (control chars stripped,
+ * whitespace collapsed) and thrown callbacks cannot break autocomplete.
  */
 export function extensionCommandToSlashCommand(cmd: RegisteredCommand): SlashCommand {
 	return {
@@ -607,8 +643,10 @@ export function extensionCommandToSlashCommand(cmd: RegisteredCommand): SlashCom
 		description: cmd.description ?? "(hook command)",
 		icon: getSlashCommandTypeIcon("extension"),
 		getArgumentCompletions: cmd.getArgumentCompletions,
-		getInlineHint: cmd.getInlineHint,
-		getAutocompleteDescription: cmd.getAutocompleteDescription,
+		getInlineHint: cmd.getInlineHint ? wrapExtensionInlineHint(cmd.getInlineHint) : undefined,
+		getAutocompleteDescription: cmd.getAutocompleteDescription
+			? wrapExtensionAutocompleteDescription(cmd.getAutocompleteDescription)
+			: undefined,
 	};
 }
 
