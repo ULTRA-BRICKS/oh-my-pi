@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { buildManagedKernelEnv } from "../src/eval/executor-base";
 import { buildHookIdentityEnv, mergeHookIdentityEnv } from "../src/hook-identity-env";
 
 describe("hook-identity-env", () => {
@@ -26,4 +27,12 @@ describe("hook-identity-env", () => {
 			PI_SESSION_FILE: "/tmp/nested/Worker.jsonl",
 		});
 	});
+	it("buildManagedKernelEnv exports hook identity markers to eval kernels", () => {
+		const nested = "/tmp/omp-sessions/parent/Worker.jsonl";
+		expect(buildManagedKernelEnv({ sessionFile: nested, agentId: "Worker" })).toEqual({
+			PI_SESSION_FILE: nested,
+			RIG_AGENT_ID: "Worker",
+		});
+	});
 });
+

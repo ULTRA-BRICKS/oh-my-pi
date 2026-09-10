@@ -32,12 +32,14 @@ export function resolvePythonKernelIdentity(session: ToolSession): {
 	sessionId: string;
 	interpreter: string | undefined;
 	kernelOwnerId: string | undefined;
+	agentId: string | undefined;
 } {
 	return {
 		cwd: session.cwd,
 		sessionId: namespaceSessionId(session.getEvalSessionId?.() ?? defaultEvalSessionId(session)),
 		interpreter: readInterpreterSetting(session),
 		kernelOwnerId: session.getEvalKernelOwnerId?.() ?? undefined,
+		agentId: session.getAgentId?.() ?? undefined,
 	};
 }
 
@@ -65,6 +67,7 @@ export default {
 			artifactsDir: opts.session.getArtifactsDir?.() ?? undefined,
 			localRoots: resolveEvalUrlRoots(opts.session),
 			kernelOwnerId: identity.kernelOwnerId,
+			agentId: identity.agentId,
 			reset: opts.reset,
 			onChunk: opts.onChunk,
 			onStatus: opts.onStatus,

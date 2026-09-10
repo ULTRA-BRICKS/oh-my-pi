@@ -1,5 +1,6 @@
 import { logger } from "@oh-my-pi/pi-utils";
 import { Settings } from "../config/settings";
+import { mergeHookIdentityEnv } from "../hook-identity-env";
 import { OutputSink } from "../session/streaming-output";
 import type { ToolSession } from "../tools";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../tools/output-meta";
@@ -285,6 +286,8 @@ export const MANAGED_KERNEL_ENV_KEYS = [
 
 interface ManagedKernelEnvOptions {
 	sessionFile?: string;
+	/** Registry worker id for agent-hook bridges (`RIG_AGENT_ID`). */
+	agentId?: string;
 	artifactsDir?: string;
 	bridgeSessionId?: string;
 	bridge?: { url: string; token: string };
@@ -342,7 +345,10 @@ export function buildManagedKernelEnv(
 			hasKeys = true;
 		}
 	}
-	return hasKeys ? env : undefined;
+	return mergeHookIdentityEnv(hasKeys ? env : undefined, {
+		sessionFile: options.sessionFile,
+		agentId: options.agentId,
+	});
 }
 
 export function attachSessionOwner(
