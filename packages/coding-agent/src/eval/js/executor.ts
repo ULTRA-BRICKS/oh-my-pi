@@ -23,6 +23,8 @@ export interface JsExecutorOptions {
 	kernelOwnerId?: string;
 	reset?: boolean;
 	sessionFile?: string;
+	/** Registry worker id for agent-hook bridges (`RIG_AGENT_ID`). */
+	agentId?: string;
 	artifactPath?: string;
 	artifactId?: string;
 	session: ToolSession;
@@ -106,6 +108,8 @@ export async function executeJs(code: string, options: JsExecutorOptions): Promi
 			cwd: options.cwd ?? options.session.cwd,
 			session: options.session,
 			localRoots: options.localRoots,
+			sessionFile: options.sessionFile,
+			agentId: options.agentId,
 			reset: options.reset,
 			code,
 			filename: `js-cell-${crypto.randomUUID()}.js`,

@@ -19,10 +19,12 @@ export function namespaceSessionId(sessionId: string): string {
 export function resolveJsKernelIdentity(session: ToolSession): {
 	sessionKey: string;
 	ownerId: string | undefined;
+	agentId: string | undefined;
 } {
 	return {
 		sessionKey: namespaceSessionId(session.getEvalSessionId?.() ?? defaultEvalSessionId(session)),
 		ownerId: session.getEvalKernelOwnerId?.() ?? undefined,
+		agentId: session.getAgentId?.() ?? undefined,
 	};
 }
 
@@ -44,6 +46,7 @@ export default {
 			sessionId: identity.sessionKey,
 			kernelOwnerId: identity.ownerId,
 			sessionFile: opts.sessionFile,
+			agentId: opts.agentId ?? identity.agentId,
 			reset: opts.reset,
 			onChunk: opts.onChunk,
 			onStatus: opts.onStatus,

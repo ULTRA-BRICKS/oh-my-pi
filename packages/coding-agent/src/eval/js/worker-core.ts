@@ -252,6 +252,7 @@ export class WorkerCore {
 		this.#syncProcessCwd(snapshot.cwd, currentRunId);
 		if (this.#runtime) {
 			this.#runtime.setCwd(snapshot.cwd);
+			this.#runtime.syncHookIdentityEnv({ sessionFile: snapshot.sessionFile, agentId: snapshot.agentId });
 			return this.#runtime;
 		}
 		this.#runtime = new JsRuntime({
@@ -259,6 +260,7 @@ export class WorkerCore {
 			sessionId: snapshot.sessionId,
 			localRoots: snapshot.localRoots,
 		});
+		this.#runtime.syncHookIdentityEnv({ sessionFile: snapshot.sessionFile, agentId: snapshot.agentId });
 		return this.#runtime;
 	}
 

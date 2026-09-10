@@ -67,7 +67,7 @@ export default {
 			artifactsDir: opts.session.getArtifactsDir?.() ?? undefined,
 			localRoots: resolveEvalUrlRoots(opts.session),
 			kernelOwnerId: identity.kernelOwnerId,
-			agentId: identity.agentId,
+			agentId: opts.agentId ?? identity.agentId,
 			reset: opts.reset,
 			onChunk: opts.onChunk,
 			onStatus: opts.onStatus,

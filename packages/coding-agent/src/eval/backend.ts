@@ -8,6 +8,8 @@ export interface ExecutorBackendExecOptions {
 	cwd: string;
 	sessionId: string;
 	sessionFile: string | undefined;
+	/** Registry worker id for agent-hook bridges (`RIG_AGENT_ID`). */
+	agentId?: string;
 	kernelOwnerId: string | undefined;
 	signal?: AbortSignal;
 	session: ToolSession;
