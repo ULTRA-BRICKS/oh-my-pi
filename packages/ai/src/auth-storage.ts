@@ -434,6 +434,12 @@ export interface AuthCredentialStore {
 	deleteAuthCredentialsForProvider(provider: string, disabledCause: string): void;
 	getCache(key: string, options?: { includeExpired?: boolean }): string | null;
 	setCache(key: string, value: string, expiresAtSec: number): void;
+	/**
+	 * Atomically record exclusive session ownership for `key` only when the row
+	 * is absent or already owned by `sessionId`. Returns false when another
+	 * session holds the row.
+	 */
+	trySetSessionExclusiveOwner?(key: string, sessionId: string, expiresAtSec: number): boolean;
 	/** Drop all cache rows whose keys start with the supplied prefix. */
 	deleteCachePrefix?(prefix: string): void;
 	cleanExpiredCache(): void;
@@ -1786,7 +1792,9 @@ export class AuthStorage {
 			for (const entry of removed) {
 				this.#store.deleteAuthCredential(entry.id, "deduplicated duplicate credential");
 			}
-			this.#resetProviderAssignments(provider);
+			this.#resetProviderAssignments(provider, {
+				removedCredentialIds: removed.map(entry => entry.id),
+			});
 		}
 		return kept.reverse();
 	}
@@ -2192,20 +2200,12 @@ export class AuthStorage {
 	}
 
 	/** Session holding an exclusive pin on `credentialId` for `provider`, if any. */
-	#getSessionExclusiveOwner(provider: string, credentialId: number): string | undefined {
-		const cached = this.#sessionExclusiveOwners.get(provider)?.get(credentialId);
-		if (cached !== undefined) return cached;
+	#readSessionExclusiveOwnerFromStore(provider: string, credentialId: number): string | undefined {
 		try {
 			const raw = this.#store.getCache(`${SESSION_EXCLUSIVE_CACHE_PREFIX}${provider}:${credentialId}`);
 			if (!raw) return undefined;
 			const val = JSON.parse(raw) as { sessionId?: unknown };
 			if (typeof val.sessionId !== "string" || val.sessionId.length === 0) return undefined;
-			let providerHolds = this.#sessionExclusiveOwners.get(provider);
-			if (!providerHolds) {
-				providerHolds = new Map();
-				this.#sessionExclusiveOwners.set(provider, providerHolds);
-			}
-			providerHolds.set(credentialId, val.sessionId);
 			return val.sessionId;
 		} catch (err) {
 			logger.debug("Failed to read session exclusive pin from persistent store cache", { err });
@@ -2213,25 +2213,66 @@ export class AuthStorage {
 		}
 	}
 
-	/** Records an exclusive hold; ownership conflicts are the caller's responsibility. */
-	#setSessionExclusiveOwner(provider: string, sessionId: string, credentialId: number): void {
+	#getSessionExclusiveOwner(provider: string, credentialId: number): string | undefined {
+		const cached = this.#sessionExclusiveOwners.get(provider)?.get(credentialId);
+		if (cached !== undefined) {
+			const persisted = this.#readSessionExclusiveOwnerFromStore(provider, credentialId);
+			if (!persisted) {
+				this.#sessionExclusiveOwners.get(provider)?.delete(credentialId);
+				return undefined;
+			}
+			if (persisted !== cached) {
+				let providerHolds = this.#sessionExclusiveOwners.get(provider);
+				if (!providerHolds) {
+					providerHolds = new Map();
+					this.#sessionExclusiveOwners.set(provider, providerHolds);
+				}
+				providerHolds.set(credentialId, persisted);
+				return persisted;
+			}
+			return cached;
+		}
+		const persisted = this.#readSessionExclusiveOwnerFromStore(provider, credentialId);
+		if (!persisted) return undefined;
+		let providerHolds = this.#sessionExclusiveOwners.get(provider);
+		if (!providerHolds) {
+			providerHolds = new Map();
+			this.#sessionExclusiveOwners.set(provider, providerHolds);
+		}
+		providerHolds.set(credentialId, persisted);
+		return persisted;
+	}
+
+	/** CAS-acquire an exclusive hold for `sessionId`; returns false when another session owns it. */
+	#tryAcquireSessionExclusiveOwner(provider: string, sessionId: string, credentialId: number): boolean {
+		const expiresAtSec = Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;
+		const key = `${SESSION_EXCLUSIVE_CACHE_PREFIX}${provider}:${credentialId}`;
+		const acquired = this.#store.trySetSessionExclusiveOwner
+			? this.#store.trySetSessionExclusiveOwner(key, sessionId, expiresAtSec)
+			: (() => {
+					const owner = this.#readSessionExclusiveOwnerFromStore(provider, credentialId);
+					if (owner !== undefined && owner !== sessionId) return false;
+					try {
+						this.#store.setCache(key, JSON.stringify({ sessionId }), expiresAtSec);
+						return true;
+					} catch (err) {
+						logger.debug("Failed to write session exclusive pin to persistent store cache", { err });
+						return false;
+					}
+				})();
+		if (!acquired) return false;
 		let providerHolds = this.#sessionExclusiveOwners.get(provider);
 		if (!providerHolds) {
 			providerHolds = new Map();
 			this.#sessionExclusiveOwners.set(provider, providerHolds);
 		}
 		providerHolds.set(credentialId, sessionId);
-		try {
-			// Expires in 30 days, mirroring the sticky rows.
-			const expiresAtSec = Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;
-			this.#store.setCache(
-				`${SESSION_EXCLUSIVE_CACHE_PREFIX}${provider}:${credentialId}`,
-				JSON.stringify({ sessionId }),
-				expiresAtSec,
-			);
-		} catch (err) {
-			logger.debug("Failed to write session exclusive pin to persistent store cache", { err });
-		}
+		return true;
+	}
+
+	/** Records an exclusive hold after the caller has already acquired ownership. */
+	#setSessionExclusiveOwner(provider: string, sessionId: string, credentialId: number): void {
+		void this.#tryAcquireSessionExclusiveOwner(provider, sessionId, credentialId);
 	}
 
 	#clearSessionExclusiveOwner(provider: string, credentialId: number): void {
@@ -2465,12 +2506,20 @@ export class AuthStorage {
 		return candidates[0]?.selection ?? fallback;
 	}
 
-	#clearProviderSessionCredentialCache(provider: string): void {
+	#clearProviderStickyCredentialCache(provider: string): void {
 		try {
 			this.#store.deleteCachePrefix?.(`${SESSION_STICKY_CACHE_PREFIX}${provider}:`);
-			this.#store.deleteCachePrefix?.(`${SESSION_EXCLUSIVE_CACHE_PREFIX}${provider}:`);
 		} catch (err) {
 			logger.debug("Failed to clear provider session sticky credentials from persistent store cache", { err });
+		}
+	}
+
+	#clearProviderExclusiveCredentialCache(provider: string): void {
+		this.#sessionExclusiveOwners.delete(provider);
+		try {
+			this.#store.deleteCachePrefix?.(`${SESSION_EXCLUSIVE_CACHE_PREFIX}${provider}:`);
+		} catch (err) {
+			logger.debug("Failed to clear provider session exclusive credentials from persistent store cache", { err });
 		}
 	}
 
@@ -2478,15 +2527,24 @@ export class AuthStorage {
 	 * Clears round-robin and session assignment state for a provider.
 	 * Called when credentials are added/removed to prevent stale index references.
 	 */
-	#resetProviderAssignments(provider: string): void {
+	#resetProviderAssignments(
+		provider: string,
+		options?: { removedCredentialIds?: readonly number[]; clearAllExclusive?: boolean },
+	): void {
 		for (const key of this.#providerRoundRobinIndex.keys()) {
 			if (key.startsWith(`${provider}:`)) {
 				this.#providerRoundRobinIndex.delete(key);
 			}
 		}
 		this.#sessionLastCredential.delete(provider);
-		this.#sessionExclusiveOwners.delete(provider);
-		this.#clearProviderSessionCredentialCache(provider);
+		this.#clearProviderStickyCredentialCache(provider);
+		if (options?.clearAllExclusive) {
+			this.#clearProviderExclusiveCredentialCache(provider);
+		} else if (options?.removedCredentialIds) {
+			for (const credentialId of options.removedCredentialIds) {
+				this.#clearSessionExclusiveOwner(provider, credentialId);
+			}
+		}
 		for (const key of this.#credentialBackoff.keys()) {
 			if (key.startsWith(`${provider}:`)) {
 				this.#credentialBackoff.delete(key);
@@ -2532,7 +2590,7 @@ export class AuthStorage {
 		if (!disabled) return false;
 		const updated = entries.filter((_value, idx) => idx !== index);
 		this.#setStoredCredentials(provider, updated);
-		this.#resetProviderAssignments(provider);
+		this.#resetProviderAssignments(provider, { removedCredentialIds: [target.id] });
 		this.#emitCredentialDisabled({ provider, disabledCause });
 		return true;
 	}
@@ -2941,7 +2999,7 @@ export class AuthStorage {
 			this.#store.deleteAuthCredentialsForProvider(provider, "deleted by user");
 		}
 		this.#setStoredCredentials(provider, []);
-		this.#resetProviderAssignments(provider);
+		this.#resetProviderAssignments(provider, { clearAllExclusive: true });
 	}
 
 	/**
@@ -2962,7 +3020,7 @@ export class AuthStorage {
 			provider,
 			entries.filter((_entry, entryIndex) => entryIndex !== index),
 		);
-		this.#resetProviderAssignments(provider);
+		this.#resetProviderAssignments(provider, { removedCredentialIds: [credentialId] });
 		return true;
 	}
 
@@ -5236,13 +5294,80 @@ export class AuthStorage {
 		sessionId?: string,
 		options?: AuthApiKeyOptions,
 	): Promise<OAuthResolutionResult | undefined> {
-		const oauthCredentials = this.#getCredentialsForProvider(provider)
+				const envCredentialIdRaw = $envExact("OMP_CREDENTIAL_ID");
+		if (envCredentialIdRaw !== undefined) {
+			const credentialId = Number(envCredentialIdRaw.trim());
+			if (!Number.isInteger(credentialId) || credentialId <= 0) {
+				throw new AIError.ConfigurationError(
+					`OMP_CREDENTIAL_ID must be a positive integer, got "${envCredentialIdRaw}"`,
+				);
+			}
+			const selection = this.#getStoredOAuthSelections(provider).find(
+				candidate => candidate.credentialId === credentialId,
+			);
+			if (!selection) {
+				const disabled = await this.listDisabledCredentials(provider);
+				if (disabled.some(entry => entry.id === credentialId)) {
+					throw new AIError.OAuthError(`OMP_CREDENTIAL_ID=${credentialId} is disabled`, {
+						provider,
+						kind: "configuration",
+					});
+				}
+				throw new AIError.OAuthError(
+					`OMP_CREDENTIAL_ID=${credentialId} does not match any OAuth credential for provider: ${provider}`,
+					{ provider, kind: "configuration" },
+				);
+			}
+			const exclusiveOwner = this.#getSessionExclusiveOwner(provider, credentialId);
+			if (exclusiveOwner !== undefined && exclusiveOwner !== sessionId) {
+				throw new AIError.OAuthError(
+					`OMP_CREDENTIAL_ID=${credentialId} is exclusively held by another session`,
+					{ provider, kind: "configuration" },
+				);
+			}
+			const providerKey = this.#getProviderTypeKey(provider, "oauth");
+			const strategy = this.#rankingStrategyResolver?.(provider);
+			const rankingContext: CredentialRankingContext = {
+				modelId: options?.modelId,
+			};
+			const blockScope = strategy?.blockScope?.(rankingContext);
+			const blockScopes = credentialBlockScopesForRequest(provider, strategy, rankingContext, blockScope);
+			if (this.#isCredentialBlocked(provider, providerKey, selection.index, blockScopes)) {
+				throw new AIError.OAuthError(`OMP_CREDENTIAL_ID=${credentialId} is temporarily blocked`, {
+					provider,
+					kind: "configuration",
+				});
+			}
+			const resolved = await this.#tryOAuthCredential(
+				provider,
+				{ credential: selection.credential, index: selection.index },
+				providerKey,
+				sessionId,
+				options,
+				{
+					checkUsage: false,
+					allowBlocked: false,
+					allowFallback: false,
+					blockScope,
+					blockScopes,
+				},
+			);
+			if (!resolved) {
+				throw new AIError.OAuthError(`OAuth access unavailable for OMP_CREDENTIAL_ID=${credentialId}`, {
+					provider,
+					kind: "configuration",
+				});
+			}
+			return resolved;
+		}
+
+const oauthCredentials = this.#getCredentialsForProvider(provider)
 			.map((credential, index) => ({ credential, index }))
 			.filter((entry): entry is { credential: OAuthCredential; index: number } => entry.credential.type === "oauth");
 
 		if (oauthCredentials.length === 0) return undefined;
 
-		// Exclusive session pins: an account pinned exclusive by one session is
+		// Exclusive session pins: an account pinned exclusive by one session is		// Exclusive session pins: an account pinned exclusive by one session is
 		// invisible to every other session's selection, and the owning session
 		// resolves ONLY that account — failover never silently migrates an
 		// exclusive session to a sibling (rotation likewise reports no switch).
@@ -6291,8 +6416,9 @@ export class AuthStorage {
 		const target = stored[index];
 		if (target?.credential.type !== "oauth") return false;
 		if (options?.exclusive) {
-			const owner = this.#getSessionExclusiveOwner(provider, credentialId);
-			if (owner !== undefined && owner !== sessionId) return false;
+			if (!this.#tryAcquireSessionExclusiveOwner(provider, sessionId, credentialId)) {
+				return false;
+			}
 		}
 		this.#recordSessionCredential(provider, sessionId, "oauth", index, options?.lastUsedAtMs);
 		if (options?.exclusive) {
@@ -6302,7 +6428,6 @@ export class AuthStorage {
 					this.#clearSessionExclusiveOwner(provider, heldCredentialId);
 				}
 			}
-			this.#setSessionExclusiveOwner(provider, sessionId, credentialId);
 		} else {
 			this.#clearSessionExclusiveHolds(provider, sessionId);
 		}
@@ -7382,7 +7507,7 @@ export class AuthStorage {
 			this.#store.deleteAuthCredential(id, disabledCause);
 			const next = entries.filter((_value, idx) => idx !== index);
 			this.#setStoredCredentials(provider, next);
-			this.#resetProviderAssignments(provider);
+			this.#resetProviderAssignments(provider, { removedCredentialIds: [id] });
 			this.#emitCredentialDisabled({ provider, disabledCause });
 			return true;
 		}
