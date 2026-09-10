@@ -12,7 +12,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { getProjectAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 
 describe("extensionCommandToSlashCommand", () => {
-	it("passes through getInlineHint and getAutocompleteDescription", () => {
+	it("wraps getInlineHint and getAutocompleteDescription with sanitization", () => {
 		const getInlineHint = (argumentText: string) => (argumentText === "li" ? "st [provider]" : null);
 		const getAutocompleteDescription = () => "3 OAuth accounts";
 		const cmd: RegisteredCommand = {
@@ -26,10 +26,52 @@ describe("extensionCommandToSlashCommand", () => {
 		const slash = extensionCommandToSlashCommand(cmd);
 		expect(slash.name).toBe("accounts");
 		expect(slash.description).toBe("Manage OAuth accounts");
-		expect(slash.getInlineHint).toBe(getInlineHint);
-		expect(slash.getAutocompleteDescription).toBe(getAutocompleteDescription);
+		expect(slash.getInlineHint).toBeDefined();
+		expect(slash.getAutocompleteDescription).toBeDefined();
+		expect(slash.getInlineHint).not.toBe(getInlineHint);
+		expect(slash.getAutocompleteDescription).not.toBe(getAutocompleteDescription);
 		expect(slash.getInlineHint?.("li")).toBe("st [provider]");
 		expect(slash.getAutocompleteDescription?.()).toBe("3 OAuth accounts");
+	});
+
+	it("sanitizes newlines and control characters in hint callbacks", () => {
+		const slash = extensionCommandToSlashCommand({
+			name: "accounts",
+			getInlineHint: () => "line1\nline2\tprovider",
+			getAutocompleteDescription: () => "3\x07 OAuth\x1b[31m accounts",
+			handler: async () => {},
+		});
+
+		expect(slash.getInlineHint?.("")).toBe("line1 line2 provider");
+		expect(slash.getAutocompleteDescription?.()).toBe("3 OAuth accounts");
+	});
+
+	it("returns null or undefined when hint callbacks throw", () => {
+		const slash = extensionCommandToSlashCommand({
+			name: "accounts",
+			getInlineHint: () => {
+				throw new Error("boom");
+			},
+			getAutocompleteDescription: () => {
+				throw new Error("boom");
+			},
+			handler: async () => {},
+		});
+
+		expect(slash.getInlineHint?.("")).toBeNull();
+		expect(slash.getAutocompleteDescription?.()).toBeUndefined();
+	});
+
+	it("returns null or undefined when sanitized hint text is empty", () => {
+		const slash = extensionCommandToSlashCommand({
+			name: "accounts",
+			getInlineHint: () => "  \n\t  ",
+			getAutocompleteDescription: () => "\x00\x1f",
+			handler: async () => {},
+		});
+
+		expect(slash.getInlineHint?.("")).toBeNull();
+		expect(slash.getAutocompleteDescription?.()).toBeUndefined();
 	});
 
 	it("leaves hint callbacks undefined when the extension omits them (control case)", () => {
