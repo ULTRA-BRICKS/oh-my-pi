@@ -20,6 +20,7 @@ import {
 } from "../async";
 import type { Settings } from "../config/settings";
 import { applyDirenvPreflight, type BashResult, executeBash } from "../exec/bash-executor";
+import { mergeHookIdentityEnv } from "../hook-identity-env";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { InternalUrlRouter } from "../internal-urls";
 import { truncateToVisualLines } from "../modes/components/visual-truncate";
@@ -1082,6 +1083,10 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 					),
 				)
 			: undefined;
+		const resolvedEnvWithIdentity = mergeHookIdentityEnv(resolvedEnv, {
+			sessionFile: this.session.getSessionFile?.() ?? null,
+			agentId: this.session.getAgentId?.() ?? null,
+		});
 
 		// Resolve protocol URLs (skill://, agent://, etc.) in extracted cwd.
 		if (cwd?.includes("://") || cwd?.includes("local:/")) {
@@ -1133,7 +1138,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 				requestedTimeoutSec,
 				notices: pendingNotices,
 
-				resolvedEnv,
+				resolvedEnvWithIdentity,
 				onUpdate,
 				forwardUpdates: false,
 			});
@@ -1171,7 +1176,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 				requestedTimeoutSec,
 				notices: pendingNotices,
 
-				resolvedEnv,
+				resolvedEnvWithIdentity,
 				onUpdate,
 				forwardUpdates: !startBackgrounded,
 			});
@@ -1229,7 +1234,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			(clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty) ||
 			canUseInteractiveBashPty(pty, ctx)
 				? await applyDirenvPreflight(command, commandCwd, {
-						callerEnv: resolvedEnv,
+						callerEnv: resolvedEnvWithIdentity,
 						signal,
 						timeoutMs: this.session.settings.get("bash.direnvLoadTimeoutMs"),
 						callerTimeoutMs: timeoutMs,
@@ -1302,7 +1307,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 				// direnv-transformed command (carries any `unset -v` prefix) + merged
 				// env; falls back to the raw command/env when direnv is off/absent.
 				const bridgeCommand = backendPreflight?.command ?? command;
-				const bridgeEnv = backendPreflight?.env ?? resolvedEnv;
+				const bridgeEnv = backendPreflight?.env ?? resolvedEnvWithIdentity;
 				const shellSpawn = wrapShellLineForClientTerminal(bridgeCommand, this.session.settings.getShellConfig());
 				const createP = clientBridge.createTerminal({
 					command: shellSpawn.command,
@@ -1520,19 +1525,19 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 					cwd: commandCwd,
 					timeoutMs,
 					signal,
-					env: backendPreflight?.env ?? resolvedEnv,
+					env: backendPreflight?.env ?? resolvedEnvWithIdentity,
 					artifactPath,
 					artifactId,
 				})
 			: // executeBash runs its OWN direnv preflight internally — pass the RAW
-				// command + resolvedEnv here so the unset prefix / env merge is not
+				// command + resolvedEnvWithIdentity here so the unset prefix / env merge is not
 				// applied twice.
 				await executeBash(command, {
 					cwd: commandCwd,
 					sessionKey: this.session.getSessionId?.() ?? undefined,
 					timeout: timeoutMs ?? 0,
 					signal,
-					env: resolvedEnv,
+					env: resolvedEnvWithIdentity,
 					artifactPath,
 					artifactId,
 					onChunk: streamTailUpdates(tailBuffer, onUpdate),

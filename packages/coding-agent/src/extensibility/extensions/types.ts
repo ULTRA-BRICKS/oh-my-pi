@@ -469,6 +469,10 @@ export interface ExtensionContext {
 	cwd: string;
 	/** Session manager (read-only) */
 	sessionManager: ReadonlySessionManager;
+	/** Persisted transcript path for this session (nested for Task/eval children). */
+	getSessionFile(): string | null;
+	/** Registry worker id when this session is a dispatched subagent. */
+	getAgentId(): string | null;
 	/** Model registry for API key resolution */
 	modelRegistry: ModelRegistry;
 	/** Calling session's `local://` root mapping for external tool bridges. */
