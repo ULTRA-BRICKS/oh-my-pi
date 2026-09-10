@@ -76,6 +76,8 @@ export interface PythonExecutorOptions {
 	sessionId?: string;
 	/** Logical owner identifier for retained kernel cleanup */
 	kernelOwnerId?: string;
+	/** Registry worker id for agent-hook bridges (`RIG_AGENT_ID`). */
+	agentId?: string;
 	/** Kernel mode (session reuse vs per-call) */
 	kernelMode?: PythonKernelMode;
 	/**
