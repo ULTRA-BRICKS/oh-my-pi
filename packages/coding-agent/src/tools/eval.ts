@@ -685,6 +685,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			};
 
 			const sessionFile = session.getSessionFile?.() ?? undefined;
+			const agentId = session.getAgentId?.() ?? undefined;
 			const kernelOwnerId = session.getEvalKernelOwnerId?.() ?? undefined;
 			const { path: artifactPath, id: artifactId } = (await session.allocateOutputArtifact?.("eval")) ?? {};
 			session.assertEvalExecutionAllowed?.();
@@ -744,6 +745,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						cwd: session.cwd,
 						sessionId,
 						sessionFile: sessionFile ?? undefined,
+						agentId,
 						kernelOwnerId,
 						signal: combinedSignal,
 						session,

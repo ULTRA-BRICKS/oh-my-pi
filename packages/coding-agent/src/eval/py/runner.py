@@ -1173,6 +1173,7 @@ def _end_exec_sigint() -> None:
 
 _MANAGED_ENV_KEYS = (
     "PI_SESSION_FILE",
+    "RIG_AGENT_ID",
     "PI_ARTIFACTS_DIR",
     "PI_TOOL_BRIDGE_URL",
     "PI_TOOL_BRIDGE_TOKEN",

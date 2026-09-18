@@ -1,5 +1,6 @@
 import { logger } from "@oh-my-pi/pi-utils";
 import { Settings } from "../config/settings";
+import { mergeHookIdentityEnv } from "../hook-identity-env";
 import { OutputSink } from "../session/streaming-output";
 import type { ToolSession } from "../tools";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../tools/output-meta";
@@ -276,6 +277,7 @@ export function createCancelledKernelResult(output: string): KernelExecutionResu
 
 export const MANAGED_KERNEL_ENV_KEYS = [
 	"PI_SESSION_FILE",
+	"RIG_AGENT_ID",
 	"PI_ARTIFACTS_DIR",
 	"PI_TOOL_BRIDGE_URL",
 	"PI_TOOL_BRIDGE_TOKEN",
@@ -285,6 +287,8 @@ export const MANAGED_KERNEL_ENV_KEYS = [
 
 interface ManagedKernelEnvOptions {
 	sessionFile?: string;
+	/** Registry worker id for agent-hook bridges (`RIG_AGENT_ID`). */
+	agentId?: string;
 	artifactsDir?: string;
 	bridgeSessionId?: string;
 	bridge?: { url: string; token: string };
@@ -307,6 +311,7 @@ export function buildManagedKernelEnvPatch(
 	if (policy?.sparse) {
 		const patch: Record<string, string | undefined> = {};
 		if (options.sessionFile) patch.PI_SESSION_FILE = options.sessionFile;
+		if (options.agentId) patch.RIG_AGENT_ID = options.agentId;
 		if (options.artifactsDir) patch.PI_ARTIFACTS_DIR = options.artifactsDir;
 		if (options.bridge) {
 			patch.PI_TOOL_BRIDGE_URL = options.bridge.url;
@@ -318,6 +323,7 @@ export function buildManagedKernelEnvPatch(
 	}
 	return {
 		PI_SESSION_FILE: options.sessionFile ?? null,
+		RIG_AGENT_ID: options.agentId ?? null,
 		PI_ARTIFACTS_DIR: options.artifactsDir ?? null,
 		PI_TOOL_BRIDGE_URL: options.bridge?.url ?? null,
 		PI_TOOL_BRIDGE_TOKEN: options.bridge?.token ?? null,
@@ -342,7 +348,10 @@ export function buildManagedKernelEnv(
 			hasKeys = true;
 		}
 	}
-	return hasKeys ? env : undefined;
+	return mergeHookIdentityEnv(hasKeys ? env : undefined, {
+		sessionFile: options.sessionFile,
+		agentId: options.agentId,
+	});
 }
 
 export function attachSessionOwner(

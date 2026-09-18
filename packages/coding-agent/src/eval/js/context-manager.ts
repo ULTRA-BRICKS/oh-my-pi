@@ -16,6 +16,7 @@ import {
 	resolveOwnerScopedSessionKey,
 	type SessionOwners,
 } from "../executor-base";
+import { mergeHookIdentityEnv } from "../../hook-identity-env";
 import { shouldDetachKernel } from "../py/spawn-options";
 import type { EvalToolDescriptor, EvalToolInvokeResult } from "../types";
 import { callSessionTool, type JsStatusEvent } from "./tool-bridge";
@@ -141,6 +142,8 @@ export async function executeInVmContext(options: {
 	cwd: string;
 	session: ToolSession;
 	localRoots?: Record<string, string>;
+	sessionFile?: string;
+	agentId?: string;
 	reset?: boolean;
 	code: string;
 	filename: string;
@@ -180,7 +183,13 @@ export async function executeInVmContext(options: {
 	}
 	const session = await acquireSession(
 		sessionKey,
-		{ cwd: options.cwd, sessionId: options.sessionId, localRoots: options.localRoots },
+		{
+			cwd: options.cwd,
+			sessionId: options.sessionId,
+			localRoots: options.localRoots,
+			sessionFile: options.sessionFile,
+			agentId: options.agentId,
+		},
 		options.timeoutMs,
 		options.ownerId,
 	);
@@ -380,6 +389,8 @@ async function runOnce(
 		cwd: string;
 		session: ToolSession;
 		localRoots?: Record<string, string>;
+		sessionFile?: string;
+		agentId?: string;
 		code: string;
 		filename: string;
 		runState: VmRunState;
@@ -437,6 +448,8 @@ async function runOnce(
 				cwd: options.cwd,
 				sessionId: options.sessionId,
 				localRoots: options.localRoots,
+				sessionFile: options.sessionFile,
+				agentId: options.agentId,
 				preludes: javascriptPreludeSources(options.session),
 			},
 		});
@@ -471,7 +484,7 @@ async function acquireSession(
 	const startup = (async (): Promise<JsSession> => {
 		// Attach the message listener before sending init. Both Bun Worker messages
 		// and subprocess IPC can arrive immediately after the evaluator loads.
-		const worker = spawnJsWorker();
+		const worker = spawnJsWorker({ sessionFile: snapshot.sessionFile, agentId: snapshot.agentId });
 		const session: JsSession = {
 			sessionKey,
 			sessionId: snapshot.sessionId,
@@ -779,10 +792,19 @@ async function raceWithTimeout<T>(promise: Promise<T>, timeoutMs: number, reason
 	}
 }
 
-function spawnJsWorker(): WorkerHandle {
+function jsWorkerSpawnEnv(identity?: { sessionFile?: string; agentId?: string }): Record<string, string> {
+	return (
+		mergeHookIdentityEnv(workerEnvFromParent(), {
+			sessionFile: identity?.sessionFile,
+			agentId: identity?.agentId,
+		}) ?? workerEnvFromParent()
+	);
+}
+
+function spawnJsWorker(identity?: { sessionFile?: string; agentId?: string }): WorkerHandle {
 	if (!useWorkerThreadForTests) {
 		try {
-			return spawnJsProcess();
+			return spawnJsProcess(identity);
 		} catch (err) {
 			// Fall through to the Bun Worker rung: a worker thread still interrupts
 			// synchronous infinite loops via terminate(), which the inline fallback
@@ -810,10 +832,10 @@ function spawnBunWorker(): WorkerHandle {
 	}
 }
 
-function spawnJsProcess(): WorkerHandle {
+function spawnJsProcess(identity?: { sessionFile?: string; agentId?: string }): WorkerHandle {
 	const spawned = createWorkerSubprocess<WorkerOutbound>({
 		spawnCommand: resolveWorkerSpawnCmd(JS_EVAL_PROCESS_ARG),
-		env: workerEnvFromParent(),
+		env: jsWorkerSpawnEnv(identity),
 		exitLabel: "JS eval worker",
 		detached: shouldDetachKernel(process.platform),
 		reportCleanExit: true,
