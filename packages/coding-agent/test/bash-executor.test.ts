@@ -260,6 +260,70 @@ describe("executeBash", () => {
 		});
 		expect(result.output.trim()).toBe("hello");
 	});
+	it("merges trusted identity into the spawn env", async () => {
+		const result = await executeBash('echo "$RIG_AGENT_ID:$PI_SESSION_FILE"', {
+			cwd: tempDir,
+			timeout: 5000,
+			identity: { agentId: "Worker", sessionFile: "/tmp/nested/Worker.jsonl" },
+		});
+		expect(result.output.trim()).toBe("Worker:/tmp/nested/Worker.jsonl");
+	});
+
+	it("clears a caller-forged identity value when the real identity is blank", async () => {
+		const result = await executeBash('echo "[$RIG_AGENT_ID]"', {
+			cwd: tempDir,
+			timeout: 5000,
+			env: { RIG_AGENT_ID: "forged" },
+			identity: {},
+		});
+		expect(result.output.trim()).toBe("[]");
+	});
+
+	it("applies identity after direnv so it wins over a hostile .envrc value", async () => {
+		const spy = vi
+			.spyOn(direnvModule, "loadDirenvEnv")
+			.mockResolvedValue({ set: { RIG_AGENT_ID: "direnv-forged" }, unset: [] });
+		try {
+			const result = await executeBash("echo $RIG_AGENT_ID", {
+				cwd: tempDir,
+				timeout: 5000,
+				identity: { agentId: "Worker" },
+			});
+			expect(result.output.trim()).toBe("Worker");
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	it("survives a hostile .envrc that unsets the identity variable by name", async () => {
+		const spy = vi.spyOn(direnvModule, "loadDirenvEnv").mockResolvedValue({ set: {}, unset: ["RIG_AGENT_ID"] });
+		try {
+			const result = await executeBash('echo "[$RIG_AGENT_ID]"', {
+				cwd: tempDir,
+				timeout: 5000,
+				identity: { agentId: "Worker" },
+			});
+			expect(result.output.trim()).toBe("[Worker]");
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	it("clears an identity var inherited from this process's own environment, not just a caller overlay", async () => {
+		const original = Bun.env.RIG_AGENT_ID;
+		Bun.env.RIG_AGENT_ID = "inherited-from-parent";
+		try {
+			const result = await executeBash('echo "[$RIG_AGENT_ID]"', {
+				cwd: tempDir,
+				timeout: 5000,
+				identity: {},
+			});
+			expect(result.output.trim()).toBe("[]");
+		} finally {
+			if (original === undefined) delete Bun.env.RIG_AGENT_ID;
+			else Bun.env.RIG_AGENT_ID = original;
+		}
+	});
 
 	it("applies non-interactive environment defaults", async () => {
 		const result = await executeBash('echo "$AGENT:$GIT_TERMINAL_PROMPT:$PI_TEST_ENV"', {
@@ -562,8 +626,72 @@ exit 64
 			expect(result.exitCode).toBe(0);
 			// config.fish must still load (#1816 contract)…
 			expect(result.output).toContain("fish-fn-ok");
+			// Regression: the blank-identity `unset -v PI_SESSION_FILE
+			// RIG_AGENT_ID; ` preflight prefix must never reach fish — it has no
+			// `unset` builtin (`set --erase` instead) and would emit this error
+			// on every command if the POSIX-shell gate were wrong.
+			expect(result.output).not.toContain("Unknown command");
 			// …but the shell must not be a login shell.
 			expect(result.output).not.toContain("fish-login-side-effect");
+		} finally {
+			removeSyncWithRetries(shellDir);
+		}
+	});
+
+	it("omits the identity unset-v prefix for a non-POSIX shell (fish), unlike the isCmdShell-only gate", async () => {
+		if (process.platform === "win32") {
+			return;
+		}
+
+		// A stand-in for a real fish binary: `isPosixShell`/`isCmdShell` both
+		// key off the basename, so naming this fake "fish" exercises the same
+		// classification a real fish install would without depending on one
+		// being present on the CI machine. It forwards the received command
+		// line to `/bin/sh -c` so the test still observes real output, while
+		// separately capturing the exact command string it was given.
+		const shellDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-fish-unset-prefix-"));
+		const marker = path.join(shellDir, "received-command");
+		const markerEscaped = marker.replace(/'/g, "'\\''");
+		const fakeFish = path.join(shellDir, "fish");
+		fs.writeFileSync(
+			fakeFish,
+			`#!/bin/sh
+for arg in "$@"; do
+	case "$arg" in
+		-*) continue ;;
+		*) printf '%s' "$arg" > '${markerEscaped}'; exec /bin/sh -c "$arg" ;;
+	esac
+done
+exit 64
+`,
+		);
+		fs.chmodSync(fakeFish, 0o755);
+		Settings.instance.set("shellPath", fakeFish);
+
+		vi.spyOn(Settings.prototype, "getShellConfig").mockReturnValue({
+			shell: fakeFish,
+			args: ["-l", "-c"],
+			env: { PATH: Bun.env.PATH ?? "", HOME: shellDir },
+			prefix: undefined,
+		});
+
+		try {
+			const result = await executeBash("printf 'fish-unset-prefix-ok\\n'", {
+				cwd: tempDir,
+				timeout: 5000,
+				sessionKey: "fish-unset-prefix",
+				useUserShell: true,
+			});
+
+			expect(result.cancelled).toBe(false);
+			expect(result.exitCode).toBe(0);
+			expect(result.output.trim()).toBe("fish-unset-prefix-ok");
+			// Blank identity (no `identity` option) would prepend `unset -v
+			// PI_SESSION_FILE RIG_AGENT_ID; ` for any shell the old
+			// `isCmdShell` gate let through — fish included, where `unset`
+			// isn't a builtin. The `isPosixShell` gate must skip it here.
+			const receivedCommand = fs.readFileSync(marker, "utf8");
+			expect(receivedCommand).not.toContain("unset -v");
 		} finally {
 			removeSyncWithRetries(shellDir);
 		}
@@ -860,7 +988,7 @@ exit 64
 		const ownerDispatched = Promise.withResolvers<void>();
 		const isolatedDispatched = Promise.withResolvers<void>();
 		vi.spyOn(piNatives.Shell.prototype, "run").mockImplementation(options => {
-			if (options.command === "owner") {
+			if (options.command.endsWith("owner")) {
 				ownerDispatched.resolve();
 				return ownerResult.promise;
 			}

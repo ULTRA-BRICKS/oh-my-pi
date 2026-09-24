@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `OMP_CREDENTIAL_ID` environment variable to pin OAuth credential selection to a specific stored credential id without round-robin fallback to sibling accounts. Honored only when the variable was present in the real process launch environment (currently detectable on Linux only) — never when a project's `.env` file sets it, so a cloned repository cannot hijack which stored account gets used, and never when the pinned account isn't entitled for the requested model's account-gated access. Worker, daemon, and PTY child processes spawned by omp only forward the variable when it is verified as launch-sourced in the spawning process, so a `.env`-laundered value cannot re-verify as genuine one process hop down.
+
 ## [18.3.0] - 2026-09-24
 
 ### Added

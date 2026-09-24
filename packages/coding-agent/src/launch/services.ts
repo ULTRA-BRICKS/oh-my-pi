@@ -9,6 +9,7 @@ import { type DaemonBrokerClient, daemonClientForProject } from "./client";
 import { canonicalProjectDir } from "./paths";
 import type { DaemonOperation, DaemonRpcResult } from "./protocol";
 import { renderTerminalOutputIsolated } from "./terminal-output-worker-client";
+import { HOOK_IDENTITY_ENV_KEYS } from "../hook-identity-env";
 import type { ToolSession } from "../tools";
 import { resolveToCwd } from "../tools/path-utils";
 
@@ -172,6 +173,28 @@ export async function serviceLogs(session: ToolSession, name: string, signal?: A
 	return (await serviceLogsWithRows(session, name, signal)).text;
 }
 
+/**
+ * Builds a named service's spawn env: the configured shell's base env,
+ * overlaid with the caller's `env` — but with the trusted subagent-identity
+ * markers (`PI_SESSION_FILE`, `RIG_AGENT_ID`) stripped from the base first.
+ *
+ * `shellEnv` can carry an inherited or dotenv-origin identity value (its base
+ * env is not identity-filtered), and an overlay only adds/overrides — it
+ * never removes a base value. Without this, a blank real identity in
+ * `callerEnv` (see bash.ts's `mergeHookIdentityEnv` call, which correctly
+ * omits the key when blank) would leave a forged/ambient value from
+ * `shellEnv` standing in for it. Stripping unconditionally means only a
+ * genuine identity — present in `callerEnv` — can ever set these keys.
+ */
+export function buildServiceSpawnEnv(
+	shellEnv: Record<string, string>,
+	callerEnv: Record<string, string> | undefined,
+): Record<string, string> {
+	const base = { ...shellEnv };
+	for (const key of HOOK_IDENTITY_ENV_KEYS) delete base[key];
+	return { ...base, ...callerEnv };
+}
+
 export async function startService(
 	session: ToolSession,
 	params: ServiceStart,
@@ -200,7 +223,7 @@ export async function startService(
 		name: params.name,
 		application: shell.shell,
 		args: [...shell.args, `${shell.prefix ? `${shell.prefix} ` : ""}${params.command}`],
-		env: { ...shell.env, ...params.env },
+		env: buildServiceSpawnEnv(shell.env, params.env),
 		cwd: resolveToCwd(params.cwd ?? session.cwd, session.cwd),
 		pty: params.pty ?? true,
 		ready: ready

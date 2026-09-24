@@ -316,6 +316,20 @@ export interface ToolSession {
 	getMnemopiSessionState?: () => MnemopiSessionState | undefined;
 	/** Agent identity used for IRC routing. Returns the registry id (e.g. "Main", "AuthLoader"). */
 	getAgentId?: () => string | null;
+	/**
+	 * Whether this session is a genuinely dispatched subagent, and if so its
+	 * registry worker id — used ONLY to build trusted hook-identity env
+	 * (`PI_SESSION_FILE`/`RIG_AGENT_ID`, see hook-identity-env.ts) for spawned
+	 * bash/PTY/service children. Deliberately distinct from `getAgentId`:
+	 * that field always resolves to a routing id (falling back to `"Main"`
+	 * for the top-level session) because IRC/hub messaging, async job
+	 * ownership, and workpool naming all need a stable non-null key even for
+	 * main sessions. Hook-identity needs the OPPOSITE — null for the common
+	 * main-session case, so its blank-identity `unset -v` anti-forgery
+	 * prefix actually fires there instead of treating "Main" as if it were a
+	 * dispatched subagent's real, trust-worthy identity.
+	 */
+	getHookIdentityAgentId?: () => string | null;
 	/** Look up a registered tool by name (used by the eval js backend's tool bridge). */
 	getToolByName?: (name: string) => AgentTool | undefined;
 	/** Look up an enabled tool through the eval bridge's normal permission pipeline. */

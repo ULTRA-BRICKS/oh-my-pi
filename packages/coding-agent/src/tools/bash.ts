@@ -19,6 +19,7 @@ import { isPosixShell } from "@oh-my-pi/pi-utils/procmgr";
 import { DEFAULT_AUTO_BACKGROUND_THRESHOLD_MS, raceJobSettlement, resolveAutoBackgroundWaitMs } from "../async";
 import type { Settings } from "../config/settings";
 import { applyDirenvPreflight, type BashResult, executeBash } from "../exec/bash-executor";
+import { buildHookIdentityEnv, HOOK_IDENTITY_ENV_KEYS, mergeHookIdentityEnv } from "../hook-identity-env";
 import { InternalUrlRouter } from "../internal-urls";
 import bashDescription from "../prompts/tools/bash.md" with { type: "text" };
 import type {
@@ -139,8 +140,14 @@ const BASH_PATTERN_APPROVAL_VALUES = new Set(["allow", "deny", "prompt"]);
 export function wrapShellLineForClientTerminal(
 	line: string,
 	shellConfig: { shell: string; args: string[]; prefix?: string | undefined },
+	unsetPrefix = "",
 ): { command: string; args: string[] } {
-	const finalLine = shellConfig.prefix ? `${shellConfig.prefix} ${line}` : line;
+	// `unsetPrefix` (a leading `unset -v NAME…; ` statement) must land BEFORE
+	// any configured shell prefix, matching `applyDirenvPreflight`'s own
+	// ordering: a prefix like `sudo strace` wraps the real command, never an
+	// unrelated `unset` statement ahead of it.
+	const prefixedLine = shellConfig.prefix ? `${shellConfig.prefix} ${line}` : line;
+	const finalLine = `${unsetPrefix}${prefixedLine}`;
 	return { command: shellConfig.shell, args: [...shellConfig.args, finalLine] };
 }
 
@@ -805,6 +812,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						sessionKey: `${this.session.getSessionId?.() ?? ""}:async:${jobId}`,
 						timeout: options.timeoutMs ?? 0,
 						signal: runSignal,
+						identity: {
+							sessionFile: this.session.getSessionFile?.() ?? null,
+							agentId: this.session.getHookIdentityAgentId?.() ?? null,
+						},
 						artifactPath,
 						artifactId,
 						onChunk: chunk => {
@@ -982,7 +993,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					command,
 					cwd: commandCwd,
 					pty: pty ?? true,
-					env,
+					env: mergeHookIdentityEnv(env, {
+						sessionFile: this.session.getSessionFile?.() ?? null,
+						agentId: this.session.getHookIdentityAgentId?.() ?? null,
+					}),
 					ready,
 				},
 				signal,
@@ -1126,15 +1140,51 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// `callerTimeoutMs` clamps the direnv load to a positive command timeout
 		// (the backend's own timeout is installed only after this await), matching
 		// the executeBash branch so a cold `.envrc` can't outlast a short call.
+		//
+		// Identity goes into `callerEnv` (not merged in only afterward), same
+		// as `executeBash`: `applyDirenvPreflight` only excludes a name from
+		// its own `unset -v` prefix when the caller re-supplies it, so an
+		// `.envrc` doing `unset RIG_AGENT_ID` would otherwise strip the
+		// identity from inside the very shell that runs the command. A blank
+		// real identity gets its own `unset -v` prefix too — an env overlay
+		// can only add/override, never remove a value this process would
+		// otherwise pass down (inherited env, a project `.env`), so ambient
+		// inheritance could forge the identity a hook trusts.
+		const identity = {
+			sessionFile: this.session.getSessionFile?.() ?? null,
+			agentId: this.session.getHookIdentityAgentId?.() ?? null,
+		};
+		const identityPatch = buildHookIdentityEnv(identity);
+		// `unset -v` is POSIX shell syntax: never emit it when the resolved
+		// shell is cmd.exe (the Windows no-bash ACP-terminal fallback), which
+		// would fail on it.
+		const identityUnsetKeys = isPosixShell(this.session.settings.getShellConfig().shell)
+			? HOOK_IDENTITY_ENV_KEYS.filter(key => !(key in identityPatch))
+			: [];
+		const identityUnsetPrefix = identityUnsetKeys.length > 0 ? `unset -v ${identityUnsetKeys.join(" ")}; ` : "";
+		// `identityUnsetPrefix` is deliberately NOT baked into this command:
+		// the PTY consumer (which never applies `shellConfig.prefix`) prepends
+		// it directly, while the ACP terminal-bridge consumer must thread it
+		// (combined with direnv's own `unsetPrefix`) through
+		// `wrapShellLineForClientTerminal` so a configured shell prefix
+		// (`PI_SHELL_PREFIX`/`CLAUDE_CODE_SHELL_PREFIX`, e.g. `sudo strace`)
+		// wraps only the real command — not either unset statement, or the
+		// prefix would target `unset` instead of `command`.
 		const backendPreflight =
 			(clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty) ||
 			canUseInteractiveBashPty(pty === true, ctx)
 				? await applyDirenvPreflight(command, commandCwd, {
+						callerEnv: identityPatch,
 						signal,
 						timeoutMs: this.session.settings.get("bash.direnvLoadTimeoutMs"),
 						callerTimeoutMs: timeoutMs,
 						direnvSetting: this.session.settings.get("bash.direnv"),
-					})
+					}).then(preflight => ({
+						command: preflight.command,
+						rawCommand: preflight.rawCommand,
+						unsetPrefix: preflight.unsetPrefix,
+						env: mergeHookIdentityEnv(preflight.env, identity),
+					}))
 				: undefined;
 
 		// Route through the client terminal when the client advertises the terminal capability.
@@ -1199,11 +1249,18 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			signal?.addEventListener("abort", onAbortSignal, { once: true });
 
 			try {
-				// direnv-transformed command (carries any `unset -v` prefix) + direnv
-				// env; falls back to the raw command when direnv is off/absent.
-				const bridgeCommand = backendPreflight?.command ?? command;
+				// Raw command (no unset statement baked in) + direnv env; falls back
+				// to the raw tool command when direnv is off/absent. Both unset
+				// prefixes (direnv's and identity's) are threaded in separately so
+				// they land before any configured shell prefix, not inside it.
+				const bridgeCommand = backendPreflight?.rawCommand ?? command;
 				const bridgeEnv = backendPreflight?.env;
-				const shellSpawn = wrapShellLineForClientTerminal(bridgeCommand, this.session.settings.getShellConfig());
+				const bridgeUnsetPrefix = `${identityUnsetPrefix}${backendPreflight?.unsetPrefix ?? ""}`;
+				const shellSpawn = wrapShellLineForClientTerminal(
+					bridgeCommand,
+					this.session.settings.getShellConfig(),
+					bridgeUnsetPrefix,
+				);
 				const createP = clientBridge.createTerminal({
 					command: shellSpawn.command,
 					args: shellSpawn.args,
@@ -1415,8 +1472,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			? await runInteractiveBashPty(interactiveUi, {
 					// PTY bypasses executeBash, so feed it the direnv-transformed
 					// command + direnv env (backendPreflight is defined whenever this
-					// branch runs, since both gate on canUseInteractiveBashPty).
-					command: backendPreflight?.command ?? command,
+					// branch runs, since both gate on canUseInteractiveBashPty). The
+					// identity unset prefix is safe to prepend directly here — unlike
+					// the ACP terminal-bridge branch, the PTY path never wraps the
+					// command in a configured shell prefix, so there's no ordering
+					// hazard to thread it around.
+					command: `${identityUnsetPrefix}${backendPreflight?.command ?? command}`,
 					cwd: commandCwd,
 					timeoutMs,
 					signal,
@@ -1431,6 +1492,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					sessionKey: this.session.getSessionId?.() ?? undefined,
 					timeout: timeoutMs ?? 0,
 					signal,
+					identity: {
+						sessionFile: this.session.getSessionFile?.() ?? null,
+						agentId: this.session.getHookIdentityAgentId?.() ?? null,
+					},
 					artifactPath,
 					artifactId,
 					onChunk: streamTailUpdates(tailBuffer, onUpdate),

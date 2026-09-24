@@ -32,6 +32,9 @@ function makeSession(): ToolSession {
 			getBashInterceptorRules() {
 				return [];
 			},
+			getShellConfig() {
+				return { shell: "/bin/bash", args: ["-c"], env: {}, prefix: undefined };
+			},
 		},
 		getClientBridge: () => undefined,
 	} as unknown as ToolSession;

@@ -7128,6 +7128,15 @@ export class AgentSession {
 			hasUI: false,
 			cwd: this.sessionManager.getCwd(),
 			sessionManager: this.sessionManager,
+			getSessionFile: () => this.sessionManager.getSessionFile() ?? null,
+			// `ExtensionContext.getAgentId` is documented as "registry worker id
+			// when this session is a dispatched subagent" — i.e. null for main.
+			// `this.getAgentId()` (`#agentId`) is already resolved to a routing
+			// id (falls back to `"Main"`) for other consumers (IRC/hub routing,
+			// async job ownership), so it can't distinguish main here; gate on
+			// `#agentKind` instead, matching `ExtensionRunner.createContext`'s
+			// `getHookIdentityAgentId` wiring for the primary (non-fallback) path.
+			getAgentId: () => (this.#agentKind === "main" ? null : (this.getAgentId() ?? null)),
 			modelRegistry: this.#modelRegistry,
 			isProjectTrusted: () => true,
 

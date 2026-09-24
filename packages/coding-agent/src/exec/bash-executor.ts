@@ -7,13 +7,19 @@ import { ExponentialYield } from "@oh-my-pi/pi-agent-core/utils/yield";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { type MinimizerOptions, PtySession, Shell, type ShellRunResult } from "@oh-my-pi/pi-natives";
 import { $env } from "@oh-my-pi/pi-utils/env";
-import { isCmdShell, isExecutable, type ShellConfig } from "@oh-my-pi/pi-utils/procmgr";
+import { isCmdShell, isExecutable, isPosixShell, type ShellConfig } from "@oh-my-pi/pi-utils/procmgr";
 import { Settings, type ShellMinimizerSettings } from "../config/settings";
 import { type OutputArtifactError, OutputSink, type OutputSummary } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../tools/output-meta";
 import { getOrCreateSnapshot } from "../utils/shell-snapshot";
 import { TerminalGraphicsDecoder } from "../utils/terminal-graphics";
 import { loadDirenvEnv } from "./direnv";
+import {
+	buildHookIdentityEnv,
+	HOOK_IDENTITY_ENV_KEYS,
+	type HookIdentityEnvInput,
+	mergeHookIdentityEnv,
+} from "../hook-identity-env";
 import { buildNonInteractiveEnv } from "./non-interactive-env";
 
 export interface BashExecutorOptions {
@@ -27,6 +33,13 @@ export interface BashExecutorOptions {
 	sessionKey?: string;
 	/** Additional environment variables to inject */
 	env?: Record<string, string>;
+	/**
+	 * Trusted subagent identity (`PI_SESSION_FILE` / `RIG_AGENT_ID`) merged into
+	 * the spawn env after direnv preflight, so it always wins over both caller
+	 * `env` and anything an `.envrc` sets — and is explicitly cleared, not left
+	 * inherited, when the real identity is blank. See `mergeHookIdentityEnv`.
+	 */
+	identity?: HookIdentityEnvInput;
 	/** Run through the configured user shell instead of brush parsing directly. */
 	useUserShell?: boolean;
 	/** Run supported user shells (zsh/fish) on a headless PTY; requires `useUserShell`. */
@@ -117,7 +130,7 @@ export async function applyDirenvPreflight(
 	command: string,
 	cwd: string,
 	opts: DirenvPreflightOptions,
-): Promise<{ command: string; env: Record<string, string> | undefined }> {
+): Promise<{ command: string; env: Record<string, string> | undefined; unsetPrefix: string; rawCommand: string }> {
 	const withPrefix = (line: string): string => (opts.commandPrefix ? `${opts.commandPrefix} ${line}` : line);
 	// A positive caller deadline clamps the direnv load below its full budget so
 	// a cold `.envrc` can't outlast a short-timeout command; `0`/undefined means
@@ -130,7 +143,8 @@ export async function applyDirenvPreflight(
 	const direnvDiff =
 		opts.direnvSetting === "off" ? null : await loadDirenvEnv(cwd, { timeoutMs: loadTimeoutMs, signal: opts.signal });
 	if (!direnvDiff) {
-		return { command: withPrefix(command), env: opts.callerEnv };
+		const rawCommand = withPrefix(command);
+		return { command: rawCommand, env: opts.callerEnv, unsetPrefix: "", rawCommand };
 	}
 	// The caller's explicit env still wins over direnv-provided values.
 	const mergedEnv = { ...direnvDiff.set, ...opts.callerEnv };
@@ -142,7 +156,15 @@ export async function applyDirenvPreflight(
 		name => !(opts.callerEnv && name in opts.callerEnv) && SAFE_ENV_NAME.test(name),
 	);
 	const unsetPrefix = direnvUnsets.length > 0 ? `unset -v ${direnvUnsets.join(" ")}; ` : "";
-	return { command: `${unsetPrefix}${withPrefix(command)}`, env: mergedEnv };
+	// `unsetPrefix` and `rawCommand` are also returned standalone (not just the
+	// combined `command`): a caller that defers its own shell-prefix wrap (no
+	// `commandPrefix` given, e.g. the ACP terminal bridge) needs to insert
+	// that prefix between the unset statement and the real command, not
+	// around the whole combined string — and must not reconstruct it by
+	// slicing `unsetPrefix.length` off `command`, which breaks the moment
+	// this function's formatting changes.
+	const rawCommand = withPrefix(command);
+	return { command: `${unsetPrefix}${rawCommand}`, env: mergedEnv, unsetPrefix, rawCommand };
 }
 
 const shellSessions = new Map<string, Shell>();
@@ -382,12 +404,21 @@ function resolveUserShellConfig(settings: Settings, baseConfig: ShellConfig): Sh
  * Env for the user-shell PTY path: keep the non-interactive guards (pagers,
  * editors, credential prompts) but restore color — the PTY makes stdout a
  * TTY, so TERM/NO_COLOR/CI are all that keep tools monochrome.
+ *
+ * `shellEnv` (the configured shell's base env, not identity-filtered) is
+ * stripped of the trusted subagent-identity markers before `commandEnv`
+ * (which already correctly omits them when the real identity is blank)
+ * overlays on top — an overlay can only add/override, never remove a base
+ * value, so an ambient or dotenv-origin `PI_SESSION_FILE` / `RIG_AGENT_ID`
+ * in `shellEnv` would otherwise survive underneath a blank real identity.
  */
 function buildUserShellPtyEnv(
 	shellEnv: Record<string, string>,
 	commandEnv: Record<string, string>,
 ): Record<string, string> {
-	const env: Record<string, string> = { ...shellEnv, ...commandEnv, TERM: "xterm-256color" };
+	const base = { ...shellEnv };
+	for (const key of HOOK_IDENTITY_ENV_KEYS) delete base[key];
+	const env: Record<string, string> = { ...base, ...commandEnv, TERM: "xterm-256color" };
 	delete env.NO_COLOR;
 	delete env.CI;
 	return env;
@@ -489,22 +520,51 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	// signal + timeout so an aborted / short-timeout call can't hang on a cold
 	// `.envrc` load before the abort listener is installed. The helper applies
 	// the configured shell `prefix` after any `unset -v` it prepends.
+	//
+	// Non-blank identity goes into `callerEnv` (not just merged in afterward):
+	// `applyDirenvPreflight` only omits a name from its own `unset -v` prefix
+	// when the caller re-supplies it, so an `.envrc` doing `unset RIG_AGENT_ID`
+	// would otherwise blank the identity we just set, from inside the very
+	// shell that runs the command.
+	const identityPatch = buildHookIdentityEnv(options?.identity ?? {});
 	const preflight = await applyDirenvPreflight(command, commandCwd ?? process.cwd(), {
-		callerEnv: options?.env,
+		callerEnv: { ...options?.env, ...identityPatch },
 		signal: options?.signal,
 		timeoutMs: settings.get("bash.direnvLoadTimeoutMs"),
 		callerTimeoutMs: options?.timeout,
 		direnvSetting: settings.get("bash.direnv"),
 		commandPrefix: prefix,
 	});
-	const commandEnv = buildNonInteractiveEnv(preflight.env);
+	// Re-merge after direnv too: a blank real identity must clear any value
+	// direnv itself `set` (not just an unset it skipped), and this is also
+	// where a caller-forged value in `options.env` gets cleared for good.
+	const commandEnv = buildNonInteractiveEnv(mergeHookIdentityEnv(preflight.env, options?.identity ?? {}));
+	// An env overlay only adds/overrides — it cannot remove a value the child
+	// would otherwise inherit from this process's own environment (or a
+	// snapshot/bashrc `export`). Whichever managed key has no real identity
+	// prepends a real `unset -v` for it, mirroring direnv's own unset handling
+	// above, so a blank identity is never spoofable by ambient inheritance.
+	// `unset -v` is POSIX shell syntax. On the default path `preflightCommand`
+	// is handed to the embedded brush shell as-is — brush always understands
+	// POSIX `unset -v` regardless of what `shell` is merely *configured* as
+	// (e.g. fish for the `!` hotkey) — so the gate only needs to check
+	// `isPosixShell(shell)` on the two paths where `shell` itself genuinely
+	// parses the text: wrapped via `buildUserShellCommand` (its `-c` argument
+	// is interpreted by the real shell binary) and the headless-PTY path.
+	// cmd.exe (the Windows no-bash fallback) never takes either of those
+	// paths, so it always falls through to the always-safe brush case.
 	const runCdInPersistentShell = options?.useUserShell === true && !prefix && isPersistentShellCdCommand(command);
+	const wrapsRealUserShell =
+		options?.useUserShell === true && !bashShell && !isCmdShell(shell) && !runCdInPersistentShell;
+	const identityUnsetKeys =
+		(!usePty && !wrapsRealUserShell) || isPosixShell(shell)
+			? HOOK_IDENTITY_ENV_KEYS.filter(key => !(key in identityPatch))
+			: [];
+	const identityUnsetPrefix = identityUnsetKeys.length > 0 ? `unset -v ${identityUnsetKeys.join(" ")}; ` : "";
+	const preflightCommand = `${identityUnsetPrefix}${preflight.command}`;
 	// Never wrap in cmd.exe: it is only the Windows no-bash fallback for spawn
 	// paths, and the embedded brush shell runs the POSIX line better directly.
-	const finalCommand =
-		options?.useUserShell === true && !bashShell && !isCmdShell(shell) && !runCdInPersistentShell
-			? buildUserShellCommand(shell, args, preflight.command)
-			: preflight.command;
+	const finalCommand = wrapsRealUserShell ? buildUserShellCommand(shell, args, preflightCommand) : preflightCommand;
 
 	// Create output sink for truncation and artifact handling
 	const graphics = new TerminalGraphicsDecoder();
@@ -555,7 +615,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			return await executeUserShellPty({
 				shell,
 				args,
-				command: preflight.command,
+				command: preflightCommand,
 				cwd: commandCwd,
 				env: buildUserShellPtyEnv(shellEnv, commandEnv),
 				pty: ptyRequest,

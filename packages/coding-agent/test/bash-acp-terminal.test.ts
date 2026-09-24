@@ -94,7 +94,12 @@ describe("BashTool ACP terminal routing", () => {
 		expect(createSpy).toHaveBeenCalledTimes(1);
 		const params = createSpy.mock.calls[0]![0];
 		expect(params.command).toBe("/bin/bash");
-		expect(params.args).toEqual(["-l", "-c", "echo hi"]);
+		expect(params.args).toHaveLength(3);
+		expect(params.args?.[0]).toBe("-l");
+		expect(params.args?.[1]).toBe("-c");
+		// The blank-identity `unset -v` prefix (added so a hostile .envrc/dotenv
+		// can't forge PI_SESSION_FILE/RIG_AGENT_ID) precedes the real command.
+		expect(params.args?.[2]).toEndWith("echo hi");
 
 		// The first onUpdate must carry the terminalId so the editor can embed it
 		expect(updates.length).toBeGreaterThanOrEqual(1);
@@ -109,6 +114,114 @@ describe("BashTool ACP terminal routing", () => {
 
 		// The handle must always be released
 		expect(releaseSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("wraps the shell prefix around the real command only, never the identity unset statement", async () => {
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-prefix",
+			waitForExit: async () => ({ exitCode: 0, signal: null }),
+			currentOutput: async () => ({ output: "", truncated: false }),
+			kill: async () => {},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = { capabilities: { terminal: true }, createTerminal: async () => handle };
+		const createSpy = spyOn(bridge, "createTerminal");
+
+		// A configured shell wrapper prefix (`PI_SHELL_PREFIX`/
+		// `CLAUDE_CODE_SHELL_PREFIX`, e.g. `sudo strace`) must wrap only the
+		// real command. Regression: it used to wrap the whole line, including
+		// the leading blank-identity `unset -v` statement, so `strace` traced
+		// a non-existent `unset` command instead of the real one.
+		const session = {
+			cwd: os.tmpdir(),
+			hasUI: false,
+			skills: [],
+			getSessionFile: () => null,
+			settings: {
+				get(key: string) {
+					if (key === "async.enabled") return false;
+					if (key === "bash.autoBackground.enabled") return false;
+					if (key === "bash.autoBackground.thresholdMs") return 60_000;
+					if (key === "bashInterceptor.enabled") return false;
+					if (key === "astGrep.enabled") return false;
+					if (key === "astEdit.enabled") return false;
+					if (key === "grep.enabled") return false;
+					if (key === "glob.enabled") return false;
+					return undefined;
+				},
+				getBashInterceptorRules() {
+					return [];
+				},
+				getShellConfig() {
+					return { shell: "/bin/bash", args: ["-l", "-c"], env: {}, prefix: "sudo strace" };
+				},
+			},
+			getClientBridge: () => bridge,
+		} as unknown as ToolSession;
+
+		const tool = new BashTool(session);
+		await tool.execute("call-prefix", { command: "echo hi" }, undefined, () => {});
+
+		expect(createSpy).toHaveBeenCalledTimes(1);
+		const params = createSpy.mock.calls[0]![0];
+		expect(params.args).toHaveLength(3);
+		expect(params.args?.[2]).toBe("unset -v PI_SESSION_FILE RIG_AGENT_ID; sudo strace echo hi");
+	});
+
+	it("treats a main session as blank identity even though getAgentId resolves to a routing id", async () => {
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-main-routing",
+			waitForExit: async () => ({ exitCode: 0, signal: null }),
+			currentOutput: async () => ({ output: "", truncated: false }),
+			kill: async () => {},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = { capabilities: { terminal: true }, createTerminal: async () => handle };
+		const createSpy = spyOn(bridge, "createTerminal");
+
+		// `getAgentId` always resolves to a routing id ("Main" for the
+		// top-level session) because IRC/hub messaging, async job ownership,
+		// and workpool naming need a stable non-null key even there.
+		// Hook-identity must NOT read that field directly — it needs the
+		// dedicated `getHookIdentityAgentId`, which stays null for a main
+		// session — or "Main" would be trusted as a real dispatched
+		// subagent's identity and the blank-identity `unset -v` anti-forgery
+		// prefix would never fire on the most common (main-session) path.
+		const session = {
+			cwd: os.tmpdir(),
+			hasUI: false,
+			skills: [],
+			getSessionFile: () => null,
+			getAgentId: () => "Main",
+			getHookIdentityAgentId: () => null,
+			settings: {
+				get(key: string) {
+					if (key === "async.enabled") return false;
+					if (key === "bash.autoBackground.enabled") return false;
+					if (key === "bash.autoBackground.thresholdMs") return 60_000;
+					if (key === "bashInterceptor.enabled") return false;
+					if (key === "astGrep.enabled") return false;
+					if (key === "astEdit.enabled") return false;
+					if (key === "grep.enabled") return false;
+					if (key === "glob.enabled") return false;
+					return undefined;
+				},
+				getBashInterceptorRules() {
+					return [];
+				},
+				getShellConfig() {
+					return { shell: "/bin/bash", args: ["-l", "-c"], env: {}, prefix: undefined };
+				},
+			},
+			getClientBridge: () => bridge,
+		} as unknown as ToolSession;
+
+		const tool = new BashTool(session);
+		await tool.execute("call-main-routing", { command: "echo hi" }, undefined, () => {});
+
+		expect(createSpy).toHaveBeenCalledTimes(1);
+		const params = createSpy.mock.calls[0]![0];
+		expect(params.args?.[2]).toBe("unset -v PI_SESSION_FILE RIG_AGENT_ID; echo hi");
 	});
 
 	it("extracts graphics from cumulative terminal snapshots without leaking escapes", async () => {
@@ -162,7 +275,9 @@ describe("BashTool ACP terminal routing", () => {
 		expect(createSpy).toHaveBeenCalledTimes(1);
 		const params = createSpy.mock.calls[0]![0];
 		expect(params.command).toBe("/bin/bash");
-		expect(params.args).toEqual(["-l", "-c", line]);
+		expect(params.args?.[0]).toBe("-l");
+		expect(params.args?.[1]).toBe("-c");
+		expect(params.args?.[2]).toEndWith(line);
 		// `args` must actually be present — the bug was omitting it entirely.
 		expect(params.args).toBeDefined();
 		expect(params.args?.length).toBeGreaterThan(0);

@@ -1805,6 +1805,17 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 
 	const agentRegistry = options.agentRegistry ?? AgentRegistry.global();
 	const resolvedAgentId = options.agentId ?? options.parentTaskPrefix ?? MAIN_AGENT_ID;
+	// Hook-identity env (`PI_SESSION_FILE`/`RIG_AGENT_ID`, see hook-identity-env.ts)
+	// needs a DIFFERENT signal than `resolvedAgentId`/`getAgentId()`: that one
+	// always resolves to a routing id (falling back to `MAIN_AGENT_ID`) because
+	// IRC/hub messaging, async job ownership, and workpool naming all need a
+	// stable non-null key even for the main session — and `AgentSession` is
+	// constructed with this already-resolved value below, so its own
+	// `getAgentId()` can't distinguish "main" either. Hook-identity needs the
+	// OPPOSITE: blank for the common main-session case, so its `unset -v`
+	// anti-forgery prefix actually fires there instead of treating `"Main"`
+	// as if it were a dispatched subagent's real, trust-worthy identity.
+	const hookIdentityAgentId = options.agentId ?? options.parentTaskPrefix ?? null;
 	const resolvedAgentDisplayName = options.agentDisplayName ?? agentKind;
 	let registeredAgentRef: AgentRef | undefined;
 	/**
@@ -1913,6 +1924,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			getHindsightSessionState: () => session?.getHindsightSessionState(),
 			getMnemopiSessionState: () => session?.getMnemopiSessionState(),
 			getAgentId: () => resolvedAgentId,
+			getHookIdentityAgentId: () => hookIdentityAgentId,
 			getToolByName: name => session?.getToolByName(name),
 			getToolForEvalBridge: name => session?.getToolForEvalBridge(name),
 			getEvalBridgeToolNames: () => session?.getEvalBridgeToolNames() ?? [],
@@ -2923,6 +2935,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			settings,
 			localProtocolOptions,
 			() => (hasSession ? session.getAsyncJobSnapshot() : null),
+			() => hookIdentityAgentId,
 		);
 
 		credentialDisabledTarget = extensionRunner;

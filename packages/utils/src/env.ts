@@ -367,6 +367,30 @@ export function $envExact(name: string, env: Record<string, string | undefined> 
 }
 
 /**
+ * True when `name` was present with exactly `value` in the REAL process
+ * launch environment (`readLaunchEnv()` — `/proc/self/environ` on Linux, or
+ * `Bun.env` before dotenv autoload when the process was launched with
+ * `--no-env-file`), never inferred from dotenv/cwd state.
+ *
+ * Unlike {@link filterChildShellEnv}, this is independent of the CURRENT
+ * project directory's `.env` files: after `--cwd`, `/move`, or a session
+ * resume changes the project directory, a value Bun autoloaded from the
+ * ORIGINAL directory's `.env` can still sit in `process.env` while no longer
+ * appearing in the new directory's dotenv files — `filterChildShellEnv`
+ * would then treat that stale, untrusted value as launch-sourced. This
+ * checks the one-time launch snapshot directly instead, so a directory
+ * change can't launder a dotenv-origin value into looking launch-sourced.
+ *
+ * No snapshot exists on macOS/Windows without `--no-env-file` — callers
+ * gating a trust decision on this MUST fail closed (treat as untrusted) when
+ * it returns `false`, including that no-snapshot case; this function does
+ * not distinguish "verified absent" from "cannot verify".
+ */
+export function isLaunchEnvValue(name: string, value: string): boolean {
+	return launchEnvValues?.get(name) === value;
+}
+
+/**
  * Parses a positive decimal integer from `$env[name]`.
  * Empty, invalid, NaN, zero, or negative values return `defaultValue`.
  */

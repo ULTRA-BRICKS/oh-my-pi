@@ -420,3 +420,69 @@ describe("$envExact", () => {
 		expect($envExact(name)).toBeUndefined();
 	});
 });
+
+describe("isLaunchEnvValue", () => {
+	// `launchEnvValues` is captured once at module import, before any test in
+	// this process runs — a same-process `process.env` mutation can never
+	// simulate "present at real launch". Each case spawns a fresh subprocess
+	// with `--no-env-file` (the only way to get a snapshot outside Linux) and
+	// an explicit spawn-time `env`, so the snapshot is genuinely launch-time.
+	async function runLaunchEnvProbe(env: Record<string, string | undefined>): Promise<{
+		exitCode: number;
+		result: boolean;
+	}> {
+		const envModulePath = path.join(import.meta.dir, "..", "src", "env.ts");
+		const script = [
+			`import { isLaunchEnvValue } from ${JSON.stringify(envModulePath)};`,
+			'process.stdout.write(JSON.stringify(isLaunchEnvValue("PI_LAUNCH_ENV_PROBE", "launch-value")));',
+		].join("\n");
+		const proc = Bun.spawn([process.execPath, "--no-env-file", "--no-install", "--eval", script], {
+			env,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		expect(exitCode, stderr).toBe(0);
+		return { exitCode, result: JSON.parse(stdout) };
+	}
+
+	it("is true for a value genuinely present at process launch", async () => {
+		const { result } = await runLaunchEnvProbe({ ...process.env, PI_LAUNCH_ENV_PROBE: "launch-value" });
+		expect(result).toBe(true);
+	});
+
+	it("is false when the value differs from what was present at launch", async () => {
+		const { result } = await runLaunchEnvProbe({ ...process.env, PI_LAUNCH_ENV_PROBE: "other-value" });
+		expect(result).toBe(false);
+	});
+
+	it("is false when the name was absent at launch, even if something mutates process.env afterward", async () => {
+		const envModulePath = path.join(import.meta.dir, "..", "src", "env.ts");
+		const script = [
+			`import { isLaunchEnvValue } from ${JSON.stringify(envModulePath)};`,
+			// Simulates a project `.env`/dotenv-origin value landing in
+			// `process.env` AFTER the process actually started — exactly what a
+			// hostile repo's dotenv autoload would produce.
+			'process.env.PI_LAUNCH_ENV_PROBE = "launch-value";',
+			'process.stdout.write(JSON.stringify(isLaunchEnvValue("PI_LAUNCH_ENV_PROBE", "launch-value")));',
+		].join("\n");
+		const env = { ...process.env };
+		delete env.PI_LAUNCH_ENV_PROBE;
+		const proc = Bun.spawn([process.execPath, "--no-env-file", "--no-install", "--eval", script], {
+			env,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		expect(exitCode, stderr).toBe(0);
+		expect(JSON.parse(stdout)).toBe(false);
+	});
+});

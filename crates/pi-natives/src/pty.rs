@@ -364,6 +364,16 @@ fn run_pty_sync(
 	for name in pi_shell::shell::GIT_REPO_LOCATION_ENV_VARS {
 		cmd.env_remove(name);
 	}
+	// Same reasoning for the trusted subagent-identity markers (mirrors
+	// `HOOK_IDENTITY_ENV_KEYS` in packages/coding-agent/src/hook-identity-env.ts):
+	// this process's own env can carry an inherited or dotenv-origin
+	// `PI_SESSION_FILE` / `RIG_AGENT_ID`, and `cmd.env()` below only adds or
+	// overrides — it never removes an inherited value. Without this, a blank
+	// real identity (the caller's `env` overlay correctly omits the key) would
+	// leave a forged value from this process's own environment standing in
+	// for it in the spawned terminal.
+	cmd.env_remove("PI_SESSION_FILE");
+	cmd.env_remove("RIG_AGENT_ID");
 	if let Some(env) = config.env.as_ref() {
 		for (key, value) in env {
 			cmd.env(key, value);

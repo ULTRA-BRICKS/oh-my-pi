@@ -8,6 +8,7 @@ import {
 	isCompiledBinary,
 	isExecutable,
 	isFullyQualifiedPath,
+	isLaunchEnvValue,
 	logger,
 	postmortem,
 	stripWindowsExtendedLengthPathPrefix,
@@ -15,6 +16,7 @@ import {
 	workerHostEntry,
 } from "@oh-my-pi/pi-utils";
 import { stripGitRepoLocationEnv } from "@oh-my-pi/pi-utils/env";
+import { HOOK_IDENTITY_ENV_KEYS } from "../hook-identity-env";
 import type { Subprocess } from "bun";
 
 /**
@@ -191,6 +193,26 @@ export function workerEnvFromParent(overlay?: Record<string, string>): Record<st
 	// Inherited repo-location overrides must not reach a worker or the PTY
 	// daemons it hosts (issue #11082); an explicit overlay still wins below.
 	stripGitRepoLocationEnv(merged);
+	// Same reasoning for the trusted subagent-identity markers: this is the
+	// actual spawn-time env for every daemon/service/worker the broker
+	// launches (PTY, pipe, detached — see launch/broker.ts), so an inherited
+	// or dotenv-origin `PI_SESSION_FILE` / `RIG_AGENT_ID` here would survive
+	// underneath a caller's overlay that correctly omits a blank identity
+	// (an overlay can only add/override, never remove a base value). Only a
+	// genuine identity in `overlay` may set these keys.
+	for (const key of HOOK_IDENTITY_ENV_KEYS) delete merged[key];
+	// `OMP_CREDENTIAL_ID` must be re-verified, not forwarded verbatim: Bun
+	// autoloads a project `.env` into this process's own `Bun.env` before any
+	// of this runs, so a repo-local `.env` value is indistinguishable from a
+	// genuine one in `base` above. Forward it only when THIS process itself
+	// confirms the value truly came from its own real launch environment
+	// (`/proc/self/environ`) — otherwise every worker/daemon this spawns
+	// would treat a laundered `.env` value as launch-verified in turn, since
+	// it becomes a real env var at their own exec time.
+	const pinnedCredentialId = merged.OMP_CREDENTIAL_ID;
+	if (pinnedCredentialId !== undefined && !isLaunchEnvValue("OMP_CREDENTIAL_ID", pinnedCredentialId)) {
+		delete merged.OMP_CREDENTIAL_ID;
+	}
 	if (overlay) {
 		for (const key in overlay) merged[key] = overlay[key];
 	}
