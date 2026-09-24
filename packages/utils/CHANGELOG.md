@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Exported `isLaunchEnvValue(name, value)` from the top-level `env` module: reports whether a name/value pair was genuinely present in this process's own real launch environment (via `/proc/self/environ` on Linux, or the pre-dotenv snapshot elsewhere), so callers can distinguish a value the process was actually launched with from one a project's `.env` autoloaded afterward.
+
 ## [18.2.7] - 2026-09-21
 
 ### Changed

@@ -1,4 +1,4 @@
-import { logger } from "@oh-my-pi/pi-utils";
+import { $envExact, isLaunchEnvValue, logger } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
 import { getOAuthApiKey, getOAuthProvider } from "../registry/oauth";
 import type { OAuthCredentials, OAuthProvider } from "../registry/oauth/types";
@@ -501,6 +501,38 @@ export class CredentialSelector {
 		sessionId?: string,
 		options?: AuthApiKeyOptions,
 	): Promise<OAuthResolutionResult | undefined> {
+		const envCredentialIdRaw = $envExact("OMP_CREDENTIAL_ID");
+		// A project-local `.env` is untrusted repo content: honor the pin only
+		// when `OMP_CREDENTIAL_ID` itself was present in the REAL process
+		// launch environment (`isLaunchEnvValue`), never inferred from "absent
+		// from the current project directory's `.env` files" — that weaker
+		// check breaks under `--cwd`/`/move`/session resume: Bun autoloads the
+		// ORIGINAL directory's `.env` into `process.env` before any of those
+		// run, and a value missing from the NEW directory's dotenv would then
+		// look launch-sourced even though it never was. `isLaunchEnvValue` has
+		// no snapshot to check against outside Linux (or `--no-env-file`) and
+		// fails closed — this pin is Linux-only for now; document that in any
+		// user-facing description of `OMP_CREDENTIAL_ID`.
+		//
+		// A present-but-empty/whitespace value (`OMP_CREDENTIAL_ID=`, a natural
+		// way to "clear" the var in a shell profile) is treated as unset, not
+		// as a malformed id — a malformed-id error is a hard, process-wide
+		// throw (see below), which must never fire from an unset-equivalent
+		// value or every provider's OAuth would break at once.
+		if (
+			envCredentialIdRaw !== undefined &&
+			envCredentialIdRaw.trim().length > 0 &&
+			isLaunchEnvValue("OMP_CREDENTIAL_ID", envCredentialIdRaw)
+		) {
+			const pinned = await this.#resolveEnvPinnedOAuth(provider, sessionId, options, envCredentialIdRaw);
+			if (pinned !== undefined) return pinned;
+			// `#resolveEnvPinnedOAuth` returns undefined only when the pin is a
+			// no-op for THIS provider (the id belongs to a sibling provider, or
+			// matches no stored credential anywhere) — never for a real target
+			// match gone wrong, which it throws for instead. Fall through to
+			// normal ranked selection so one pin meant for provider A can't
+			// break every other provider's cascade.
+		}
 		await this.#deps.pool.adoptExternalChanges();
 		const credentials = this.#deps.pool
 			.credentials(provider)
@@ -830,6 +862,124 @@ export class CredentialSelector {
 		}
 
 		return undefined;
+	}
+
+	/**
+	 * `OMP_CREDENTIAL_ID` pins OAuth selection to one stored row id, bypassing
+	 * round-robin/usage ranking entirely — a fixed choice of WHICH credential
+	 * to use, not a bypass of whether that credential may be used: disabled
+	 * and rate-limit-blocked rows still reject with a clear error instead of
+	 * silently falling back to a sibling account.
+	 *
+	 * Credential ids are a single global sequence shared by every provider, so
+	 * one pin necessarily targets exactly one provider. Returns `undefined`
+	 * (never throws) when the id is a no-op for `provider` — it belongs to a
+	 * different provider, or matches no stored credential anywhere — so the
+	 * caller falls through to normal ranked selection instead of one pin
+	 * breaking every other provider's cascade. Throws only once the id is
+	 * confirmed to target `provider` and using it fails (disabled, blocked, or
+	 * refresh/access failure).
+	 *
+	 * Does not yet consult exclusive per-session account holds (see the
+	 * separate exclusive-session-pin feature) — once that lands, wire its
+	 * ownership check in here too so an env-pinned id honors an exclusive
+	 * hold the same way ranked selection does.
+	 */
+	async #resolveEnvPinnedOAuth(
+		provider: string,
+		sessionId: string | undefined,
+		options: AuthApiKeyOptions | undefined,
+		envCredentialIdRaw: string,
+	): Promise<OAuthResolutionResult | undefined> {
+		const trimmed = envCredentialIdRaw.trim();
+		if (!/^\d+$/.test(trimmed)) {
+			throw new AIError.ConfigurationError(
+				`OMP_CREDENTIAL_ID must be a positive integer, got "${envCredentialIdRaw}"`,
+			);
+		}
+		// `/^\d+$/` above already guarantees a non-negative integer string;
+		// only "0" needs rejecting here (`Number.MAX_SAFE_INTEGER` overflow on
+		// an absurdly long digit string is not a real-world id, and simply
+		// won't match any stored row below).
+		const credentialId = Number(trimmed);
+		if (credentialId <= 0) {
+			throw new AIError.ConfigurationError(
+				`OMP_CREDENTIAL_ID must be a positive integer, got "${envCredentialIdRaw}"`,
+			);
+		}
+		await this.#deps.pool.adoptExternalChanges();
+		const entries = this.#deps.pool.entries(provider);
+		const index = entries.findIndex(entry => entry.id === credentialId && entry.credential.type === "oauth");
+		if (index === -1) {
+			// Credential ids are a global sequence shared by every provider, so a
+			// pin meant for one provider is a routine "not mine" miss for every
+			// other provider's resolveOAuth call. Only surface a hard
+			// configuration error when this id demonstrably belongs to (or is
+			// disabled for) THIS provider — otherwise fall through to normal
+			// ranked selection so unrelated providers keep authenticating.
+			let ownedByAnotherProvider = false;
+			for (const otherProvider of this.#deps.pool.providers()) {
+				if (otherProvider === provider) continue;
+				if (this.#deps.pool.entries(otherProvider).some(entry => entry.id === credentialId)) {
+					ownedByAnotherProvider = true;
+					break;
+				}
+			}
+			if (ownedByAnotherProvider) return undefined;
+			const disabled = await this.#deps.pool.listDisabled(provider);
+			if (disabled.some(entry => entry.id === credentialId)) {
+				throw new AIError.OAuthError(`OMP_CREDENTIAL_ID=${credentialId} is disabled`, {
+					provider,
+					kind: "configuration",
+				});
+			}
+			// Unknown everywhere (typo, deleted row, wrong provider that also has
+			// no stored credentials to search): stay silent rather than break
+			// every provider's cascade over one bad id with no way to tell who it
+			// was meant for.
+			logger.debug("OMP_CREDENTIAL_ID does not match any stored OAuth credential", { credentialId, provider });
+			return undefined;
+		}
+		const credential = entries[index]!.credential as OAuthCredential;
+		// `accountIds` (when present) is per-account model entitlement recorded
+		// by multi-account discovery, e.g. an account-gated model like
+		// `gpt-daybreak-blue-latest` that only some accounts' own catalogs
+		// list. Routing such a model to a pinned account outside that set
+		// isn't a quota/usage concern the pin is meant to override - it's
+		// often a request the account literally cannot serve, so it gets the
+		// same explicit-error treatment as a disabled or blocked pin rather
+		// than silently misrouting to an ineligible account.
+		const accountIds = options?.accountIds;
+		if (accountIds?.length && (credential.accountId === undefined || !accountIds.includes(credential.accountId))) {
+			throw new AIError.ConfigurationError(
+				`OMP_CREDENTIAL_ID=${credentialId} is not entitled to serve model "${options?.modelId ?? "?"}"`,
+			);
+		}
+		const providerKey = providerTypeKey(provider, "oauth");
+		const strategy = this.#deps.strategies(provider);
+		const rankingContext: CredentialRankingContext = { modelId: options?.modelId };
+		const blockScope = strategy?.blockScope?.(rankingContext);
+		const blockScopes = credentialBlockScopesForRequest(provider, strategy, rankingContext, blockScope);
+		if (this.#deps.blocks.isBlocked(provider, providerKey, index, blockScopes)) {
+			throw new AIError.OAuthError(`OMP_CREDENTIAL_ID=${credentialId} is temporarily blocked`, {
+				provider,
+				kind: "configuration",
+			});
+		}
+		const resolved = await this.tryOAuth(provider, { credential, index }, providerKey, sessionId, options, {
+			checkUsage: false,
+			allowBlocked: false,
+			allowFallback: false,
+			blockScope,
+			blockScopes,
+		});
+		if (!resolved) {
+			throw new AIError.OAuthError(`OAuth access unavailable for OMP_CREDENTIAL_ID=${credentialId}`, {
+				provider,
+				kind: "configuration",
+			});
+		}
+		return resolved;
 	}
 
 	#syncOAuthSelectionFromStore(
