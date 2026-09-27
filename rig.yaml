@@ -1,0 +1,28 @@
+# rig.yaml — declarative setup for this fork, applied by `rig apply`.
+# Global defaults live at ~/.config/rig/config.yaml; this file overrides them.
+# Schema: rig-cli docs/config-schema.md
+
+version: 1
+
+# Tickets for this fork are Forgejo issues on ultrabricks/oh-my-pi.
+task:
+  backend: forgejo
+  forgejo:
+    url: https://git.hyperide.ai
+    repo: ultrabricks/oh-my-pi
+    attachment_mode: native
+
+# CI on Forgejo. Upstream's .github/workflows target GitHub-hosted and self-hosted labels
+# (ubuntu-22.04, omp-kata, macOS/Windows matrices) that no Forgejo runner offers, so their jobs
+# were never scheduled and got cancelled after a day. Forgejo reads .forgejo/workflows INSTEAD of
+# .github/workflows when it exists, so the fork gets runnable CI here while the upstream files stay
+# untouched for GitHub. The gate is the ecosystem secret scan (gitleaks over the tree, allowlist in
+# .gitleaks.toml), on every push and pull request.
+ci:
+  enabled: true
+  target: .forgejo/workflows
+  all: false
+  items:
+    secret-scan:
+      enabled: true
+      tier: block
