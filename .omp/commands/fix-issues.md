@@ -61,14 +61,20 @@ git -C "$MAIN" worktree add -B "fix/issue-<N>" "$WT" origin/main
 
 Branch: `fix/issue-<N>`; `fix/issue-<N>-<slug>` for multiple fixes. Worktree path follows `pr_checkout` convention.
 
-### d. Symlink artifacts
+### d. Symlink artifacts, install deps
 
-Before any worktree build/test, use absolute paths:
+Before any worktree build/test, symlink build outputs (absolute paths) and install JS deps in the worktree:
 
 ```bash
 cd "$WT"
 ln -snf "$MAIN/target"       "$WT/target"
-ln -snf "$MAIN/node_modules" "$WT/node_modules"
+
+# JS deps: install them IN the worktree (bunfig.toml pins the hoisted linker; a warm install
+# comes from bun's cache). Never symlink node_modules to the main checkout: `bun install` in the
+# worktree writes through the link and corrupts the main checkout's tree. A reused worktree may
+# still hold such a link from an older run: remove the link itself (never `rm -rf` through it).
+if [ -L node_modules ]; then rm node_modules; fi
+bun install --frozen-lockfile
 
 # Only the .node binaries are expensive to rebuild. The rest of
 # packages/natives/native/ is tracked by git, so folder-level symlinks would
@@ -78,7 +84,7 @@ for f in "$MAIN"/packages/natives/native/*.node; do
 done
 ```
 
-MUST NOT symlink whole `packages/natives/native/`: shadows tracked source.
+MUST NOT symlink whole `packages/natives/native/`: shadows tracked source. MUST NOT symlink `node_modules`: run `bun install --frozen-lockfile` in the worktree. If the install fails, retry once (parallel installs can hit a transient `Fail extracting tarball`); if it still fails (for example a lockfile out of sync with `package.json`), report it. MUST NOT drop `--frozen-lockfile` or commit `bun.lock` churn.
 
 ### e. Fix
 
@@ -129,7 +135,7 @@ Group worktree paths by status, `fixed` first, for batch `cd`/push.
 
 ## Rules
 
-MUST: reproduce on current-cwd `main` before worktree; parallel one-issue subagents; check existing PR first and divert reasonable ones to `review-prs`; symlink `target`, `node_modules`, native `*.node` before worktree builds/tests; conventional commits with body `Fixes #<N>`.
+MUST: reproduce on current-cwd `main` before worktree; parallel one-issue subagents; check existing PR first and divert reasonable ones to `review-prs`; symlink `target` and native `*.node`, and `bun install --frozen-lockfile` (never a `node_modules` symlink), before worktree builds/tests; conventional commits with body `Fixes #<N>`.
 
 MUST NOT: symlink entire `packages/natives/native/`; push, open PRs, or comment on issues; ship stubs, product-code mocks, or `TODO: implement` placeholders; expand beyond reported bug into adjacent code smells.
 

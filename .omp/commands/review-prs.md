@@ -48,15 +48,14 @@ MUST use `github pr_checkout`, not raw `gh pr checkout`: it creates a dedicated 
 
 #### Symlink build artifacts
 
-Before any worktree build/test, from the worktree symlink main-checkout outputs to avoid `bun check` / `cargo build` / native-loader recompilation:
+Before any worktree build/test, from the worktree symlink main-checkout build outputs to avoid `cargo build` / native-loader recompilation (JS deps are installed after the rebase, below):
 
 ```bash
 MAIN="<absolute path to main worktree, e.g. ~/Projects/pi>"
 WT="$(pwd)"
 
-# Rust target dir + JS deps (root-level in this monorepo)
+# Rust target dir (root-level in this monorepo)
 ln -snf "$MAIN/target"        "$WT/target"
-ln -snf "$MAIN/node_modules"  "$WT/node_modules"
 
 # Prebuilt native addon (avoids 30s+ napi-rs rebuild). Link only the .node
 # binaries — the rest of packages/natives/native/ is tracked by git, so
@@ -66,7 +65,7 @@ for f in "$MAIN"/packages/natives/native/*.node; do
 done
 ```
 
-Before `pr_checkout`, derive `$MAIN` from original cwd: `git rev-parse --show-toplevel`. Symlinks MUST use absolute paths: worktree is outside main repo; relative paths break. MUST NOT symlink whole `packages/natives/native/`: it shadows tracked PR changes.
+Before `pr_checkout`, derive `$MAIN` from original cwd: `git rev-parse --show-toplevel`. Symlinks MUST use absolute paths: worktree is outside main repo; relative paths break. MUST NOT symlink whole `packages/natives/native/`: it shadows tracked PR changes. MUST NOT symlink `node_modules`: install deps in the worktree after the rebase (below).
 
 #### Rebase
 
@@ -76,6 +75,24 @@ git rebase origin/main
 ```
 
 Mechanical conflicts (formatting, import order, adjacent edits): resolve, continue. Semantic conflicts: abort, note final report, do not commit.
+
+#### Install deps
+
+After the rebase, so deps match the code under review:
+
+```bash
+cd "$WT"
+# JS deps: install them IN the worktree (bunfig.toml pins the hoisted linker; a warm install
+# comes from bun's cache). Never symlink node_modules to the main checkout. A worktree reused
+# from an older run may still hold such a link: remove the link itself (never `rm -rf` through
+# it) — `bun install` would write through it and corrupt the main checkout's tree.
+# The install runs the PR's own install scripts, as its build and tests do later: for an external
+# PR, read its changes to package.json scripts, trustedDependencies and bunfig.toml BEFORE this.
+if [ -L node_modules ]; then rm node_modules; fi
+bun install --frozen-lockfile
+```
+
+If the install fails, retry once (parallel installs can hit a transient `Fail extracting tarball`); if it still fails (for example a lockfile out of sync with `package.json`), report it as a merge blocker. MUST NOT drop `--frozen-lockfile` or commit `bun.lock` churn.
 
 #### Review and fix
 
