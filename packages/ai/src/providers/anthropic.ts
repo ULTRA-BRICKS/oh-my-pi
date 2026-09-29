@@ -13,6 +13,7 @@ import {
 	logger,
 	parseJsonWithRepair,
 	parseStreamingJsonThrottled,
+	prompt,
 	readSseEvents,
 } from "@oh-my-pi/pi-utils";
 import { renderDemotedThinking } from "../dialect/demotion";
@@ -91,6 +92,7 @@ import {
 	type AnthropicMessagesClientLike,
 	calculateAnthropicRetryDelayMs,
 } from "./anthropic-client";
+import forcedToolFallbackDirective from "./anthropic-forced-tool-fallback.md" with { type: "text" };
 import {
 	type ToolInputSchema as AnthropicToolInputSchema,
 	type Tool as AnthropicWireTool,
@@ -468,6 +470,14 @@ type AnthropicProviderSessionState = ProviderSessionState & {
 	 * this (baseUrl, modelId). Cleared on session close.
 	 */
 	thinkingReplayDisabled: boolean;
+	/**
+	 * Runtime-learned: this endpoint rejected a forced `tool_choice`
+	 * (`tool`/`any`) for this model even though the catalog says it honors
+	 * one. All subsequent requests for this (baseUrl, modelId) downgrade forced
+	 * selectors to `auto` plus a directive naming the tool. Cleared on session
+	 * close.
+	 */
+	forcedToolChoiceDisabled: boolean;
 	/** Thinking blocks the API permanently dropped after a prefix mismatch. */
 	prefixDroppedThinkingBlocks: Set<string>;
 };
@@ -478,12 +488,14 @@ function createAnthropicProviderSessionState(): AnthropicProviderSessionState {
 		fastModeDisabled: false,
 		replayUnsignedThinkingDisabled: false,
 		thinkingReplayDisabled: false,
+		forcedToolChoiceDisabled: false,
 		prefixDroppedThinkingBlocks: new Set(),
 		close: () => {
 			state.strictToolsDisabled = false;
 			state.fastModeDisabled = false;
 			state.replayUnsignedThinkingDisabled = false;
 			state.thinkingReplayDisabled = false;
+			state.forcedToolChoiceDisabled = false;
 			state.prefixDroppedThinkingBlocks.clear();
 		},
 	};
@@ -1802,6 +1814,20 @@ export function isInvalidThinkingSignatureError(message: string): boolean {
 	return INVALID_THINKING_SIGNATURE_PATTERN.test(message) || MISSING_THINKING_SIGNATURE_PATTERN.test(message);
 }
 
+/**
+ * The model rejects forced tool use: `tool_choice: type "tool" and "any" are
+ * not supported for this model.` (Opus 5.5) or `tool_choice forces tool use is
+ * not compatible with this model` (Fable/Mythos 5). Quotes may arrive escaped
+ * inside a JSON error body.
+ */
+const FORCED_TOOL_CHOICE_UNSUPPORTED_PATTERN =
+	/tool_choice:?\s+(?:type\s+\\?"tool\\?"\s+and\s+\\?"any\\?"\s+are\s+not\s+supported|forces\s+tool\s+use\s+is\s+not\s+compatible)/i;
+
+/** Detects the 400 a model answers a forced `tool_choice` (`tool`/`any`) with when it cannot honor one. */
+export function isForcedToolChoiceUnsupportedError(message: string): boolean {
+	return FORCED_TOOL_CHOICE_UNSUPPORTED_PATTERN.test(message);
+}
+
 const INPUT_TRANSFORMATION_PATH_PATTERN = /^messages\.(\d+)\.content\.(\d+)$/;
 const PREFIX_BINDING_ERROR_PATH_PATTERN = /messages\.(\d+)\.content\.(\d+)/;
 
@@ -1993,6 +2019,7 @@ const streamAnthropicOnce = (
 			let forceDemoteUnsignedThinking = providerSessionState?.replayUnsignedThinkingDisabled ?? false;
 			let droppedAllThinkingForSignature = providerSessionState?.thinkingReplayDisabled ?? false;
 			let dropAllThinking = droppedAllThinkingForSignature;
+			let disableForcedToolChoice = providerSessionState?.forcedToolChoiceDisabled ?? false;
 			let prefixBindingRetryAttempted = false;
 			let prefixMismatchBehavior =
 				model.thinking?.prefixBinding && model.compat.supportsThinkingBindingControls
@@ -2052,7 +2079,9 @@ const streamAnthropicOnce = (
 				const sendsAdaptiveEffortPin =
 					isAdaptiveOnlyThinking(model) &&
 					(options?.thinkingEnabled === false ||
-						(model.compat.supportsForcedToolChoice && isForcedToolChoice(options?.toolChoice)));
+						(model.compat.supportsForcedToolChoice &&
+							!disableForcedToolChoice &&
+							isForcedToolChoice(options?.toolChoice)));
 				if (
 					model.reasoning &&
 					model.compat.supportsOutputEffort &&
@@ -2171,6 +2200,7 @@ const streamAnthropicOnce = (
 					prefixMismatchBehavior,
 					dropAllThinking,
 					droppedThinkingBlocks: providerSessionState?.prefixDroppedThinkingBlocks,
+					disableForcedToolChoice,
 					fallbacks,
 					effectiveBaseUrl: baseUrl,
 				});
@@ -3175,6 +3205,40 @@ const streamAnthropicOnce = (
 						firstTokenTime = undefined;
 						continue;
 					}
+					const sentChoiceType = params.tool_choice?.type;
+					if (
+						!disableForcedToolChoice &&
+						(sentChoiceType === "tool" || sentChoiceType === "any") &&
+						firstTokenTime === undefined &&
+						isForcedToolChoiceUnsupportedError(streamFailureMessage)
+					) {
+						// The catalog says this model honors forced tool use but the API
+						// refused it. Failing here loses the turn — for a subagent, its
+						// final report. Retry once with `auto` plus a directive naming the
+						// tool, and remember it so later forced turns skip the 400.
+						logger.warn("anthropic: forced tool_choice rejected, retrying with auto", {
+							provider: model.provider,
+							model: model.id,
+							baseUrl,
+							error: streamFailureMessage,
+						});
+						if (providerSessionState) {
+							providerSessionState.forcedToolChoiceDisabled = true;
+						}
+						disableForcedToolChoice = true;
+						params = await prepareParams();
+						providerRetryAttempt = 0;
+						output.content.length = 0;
+						output.model = model.id;
+						output.responseId = undefined;
+						output.upstreamModel = undefined;
+						output.errorMessage = undefined;
+						output.providerPayload = undefined;
+						output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
+						output.stopReason = "stop";
+						firstTokenTime = undefined;
+						continue;
+					}
 					const isTransientEnvelopeFailure =
 						AIError.isTransientStreamParseError(streamFailure) || AIError.isStreamEnvelopeError(streamFailure);
 					const isLocalIdleTimeout =
@@ -3233,6 +3297,9 @@ const streamAnthropicOnce = (
 			}
 			if (droppedAllThinkingForSignature) {
 				output.disabledFeatures = [...(output.disabledFeatures ?? []), "thinking-replay"];
+			}
+			if (disableForcedToolChoice && isForcedToolChoice(options?.toolChoice)) {
+				output.disabledFeatures = [...(output.disabledFeatures ?? []), "forced-tool-choice"];
 			}
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
@@ -4211,6 +4278,11 @@ type AnthropicParamBuildOptions = {
 	prefixMismatchBehavior?: "drop_block" | "error";
 	dropAllThinking: boolean;
 	droppedThinkingBlocks?: ReadonlySet<string>;
+	/**
+	 * The endpoint rejected a forced `tool_choice` for this model at runtime:
+	 * send `auto` plus a directive naming the tool instead.
+	 */
+	disableForcedToolChoice: boolean;
 	/** Sanitized server-side fallback entries; defaults to `options?.fallbacks` when omitted. */
 	fallbacks?: AnthropicOptions["fallbacks"];
 	/**
@@ -4242,6 +4314,7 @@ function buildParams(
 		prefixMismatchBehavior,
 		dropAllThinking,
 		droppedThinkingBlocks,
+		disableForcedToolChoice,
 		fallbacks = options?.fallbacks,
 		compactionSupported = supportsAnthropicCompaction(model),
 		effectiveBaseUrl,
@@ -4532,16 +4605,34 @@ function buildParams(
 				),
 			};
 		}
-		// Claude Fable/Mythos 5 reject forced tool use outright ("tool_choice forces
-		// tool use is not compatible with this model"). Downgrade any/tool → auto so the
-		// request succeeds; the tool stays available and the caller's prompt steers
-		// the model toward it.
-		const choiceType = params.tool_choice?.type;
-		if (
-			(choiceType === "any" || choiceType === "tool") &&
-			(compactionRequest || !model.compat.supportsForcedToolChoice)
-		) {
-			params.tool_choice = { type: "auto" };
+		// Claude Fable/Mythos 5 and Opus 5.5 reject forced tool use outright
+		// ("tool_choice forces tool use is not compatible with this model" /
+		// `tool_choice: type "tool" and "any" are not supported for this model.`).
+		// Downgrade any/tool → auto so the request succeeds; the tool stays
+		// available and the caller's prompt steers the model toward it.
+		const forcedChoice = params.tool_choice;
+		if (forcedChoice?.type === "any" || forcedChoice?.type === "tool") {
+			if (compactionRequest || !model.compat.supportsForcedToolChoice) {
+				params.tool_choice = { type: "auto" };
+			} else if (disableForcedToolChoice) {
+				// Runtime-learned rejection on a model the catalog says honors forced
+				// tool use: the caller's prompt was written for a hard force, so
+				// carry an explicit directive naming the tool in the final user turn
+				// (its own turn when the conversation has none to extend).
+				const directive = prompt.render(forcedToolFallbackDirective, {
+					toolName: forcedChoice.type === "tool" ? forcedChoice.name : undefined,
+				});
+				const lastIndex = params.messages.length - 1;
+				const last = params.messages[lastIndex];
+				if (last?.role === "user") {
+					const content =
+						typeof last.content === "string" ? [{ type: "text" as const, text: last.content }] : last.content;
+					params.messages[lastIndex] = { ...last, content: [...content, { type: "text", text: directive }] };
+				} else {
+					params.messages.push({ role: "user", content: [{ type: "text", text: directive }] });
+				}
+				params.tool_choice = { type: "auto" };
+			}
 		}
 	}
 

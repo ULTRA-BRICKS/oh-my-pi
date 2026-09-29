@@ -192,6 +192,7 @@ All providers start from the same neutral wire schema — `toolWireSchema(tool)`
 - **Results**: `user` message with `tool_result` blocks (`tool_use_id`). Images embed inside `tool_result.content`; on **error** results Anthropic rejects embedded images, so text stays in the block and images are hoisted after the `tool_result` run. Z.AI's Anthropic-shaped endpoint additionally needs `id` on the block (`requiresToolResultId`).
 - **Replay quirk**: assistant turns are stably partitioned `[...non_tool_use, ...tool_use]` so `tool_use` blocks sit at the tail — otherwise Anthropic 400s with "tool_use ids were found without tool_result blocks immediately after".
 - **Strict fallback**: a 400 strict rejection sets `providerSessionState.strictToolsDisabled` and retries without `strict`.
+- **Forced tool_choice fallback**: a 400 `tool_choice: type "tool" and "any" are not supported for this model` (or Fable's `tool_choice forces tool use is not compatible`) on a forced request sets `providerSessionState.forcedToolChoiceDisabled` and retries once with `auto` plus a directive naming the tool appended to the final user turn (`anthropic-forced-tool-fallback.md`); later forced turns for that (baseUrl, model) go out that way up front.
 
 ### OpenAI Chat Completions (`providers/openai-completions.ts`)
 
@@ -285,7 +286,7 @@ type ToolChoice =
 | --- | --- | --- | --- |
 | OpenAI Completions | `tool_choice` | strings + nested function object | `!supportsNamedToolChoice` → filter tools + `"required"`; `!supportsForcedToolChoice` → `"auto"`; forced tool absent from `tools` → delete `tool_choice`; `"none"` with no tools → dropped (LiteLLM/Bedrock proxies 400) |
 | OpenAI Responses | `tool_choice` | strings + flat function/custom/computer objects | Same named/forced downgrades; choice validated against tools **surviving schema quarantine** — a pin on a dropped tool is deleted; `{ type: "computer" }` on models without native computer use is remapped to the function tool name (also `azure-openai-responses.ts`) |
-| Anthropic | `tool_choice` | `{ type: "auto" \| "none" \| "any" \| "tool", name? }` | Names via `encodeAnthropicToolName`; `!supportsForcedToolChoice` (Fable/Mythos) → `auto` |
+| Anthropic | `tool_choice` | `{ type: "auto" \| "none" \| "any" \| "tool", name? }` | Names via `encodeAnthropicToolName`; `!supportsForcedToolChoice` (Fable/Mythos, Opus 5.5) → `auto`; runtime forced-choice rejection → `auto` + tool directive |
 | Google Gemini/Vertex | `toolConfig.functionCallingConfig` | `mode: AUTO \| NONE \| ANY` (+ `allowedFunctionNames` for pins) | Antigravity/Gemini CLI uses `mode: VALIDATED` default (`google-gemini-cli.ts`) |
 | Bedrock | `toolConfig.toolChoice` | `{ auto: {} } \| { any: {} } \| { tool: { name } }` | `planToolConfig`; `"none"` + tool history + no tools → `NO_TOOLS_SENTINEL` with `{ auto: {} }` |
 | Ollama | `tool_choice` | only `"none"` / `"required"` | Pins emulated by `selectToolsForToolChoice`: filter tools to the target, send `"required"` |

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Claude Opus 5.5 failing every turn that forces a tool (eager todo/task preludes, forced final yield, sharpshooter passes) with `400 tool_choice: type "tool" and "any" are not supported for this model`; forced selectors on the Anthropic Messages transport now downgrade to `auto` as they already did for Fable/Mythos (Bedrock Converse is tracked in [fork #14](https://git.hyperide.ai/ultrabricks/oh-my-pi/issues/14); [#12939](https://github.com/can1357/oh-my-pi/issues/12939), [fork #13](https://git.hyperide.ai/ultrabricks/oh-my-pi/issues/13)).
+
 ## [18.3.0] - 2026-09-24
 
 ### Added
