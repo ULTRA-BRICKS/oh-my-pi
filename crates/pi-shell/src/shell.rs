@@ -5454,6 +5454,112 @@ replace = [{ pattern = "^.+$", replacement = "PWD" }]
 		);
 	}
 
+	#[cfg(target_os = "macos")]
+	thread_local! {
+		static COUNT_FORKS_ON_THIS_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+	}
+	#[cfg(target_os = "macos")]
+	static HOST_FORKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+	#[cfg(target_os = "macos")]
+	extern "C" fn count_host_fork() {
+		if COUNT_FORKS_ON_THIS_THREAD.with(std::cell::Cell::get) {
+			HOST_FORKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+		}
+	}
+
+	/// Regression for oh-my-pi#11: the omp host (Bun, running this shell on
+	/// tokio workers) must launch external commands without `fork()`.
+	///
+	/// Every `fork()` runs libSystem's atfork handlers. libmalloc's handlers
+	/// read the lazily registered MallocStackLogging hooks once in prepare and
+	/// again in parent; a memory-pressure event that registers them in between
+	/// makes `_malloc_fork_parent` unlock a lock prepare never took, and the
+	/// kernel SIGKILLs the whole host ("Unlock of an os_unfair_lock not owned
+	/// by current thread"). Pre-fix, std fell back to `fork()` for every
+	/// command that needed `setsid`, an fd beyond stdio, or a relative program
+	/// under a cwd. A `pthread_atfork` hook counts forks made by this test's
+	/// runtime threads while several shells launch such commands concurrently.
+	#[cfg(target_os = "macos")]
+	#[test]
+	fn external_commands_launch_without_forking_the_host() {
+		use std::{os::unix::fs::PermissionsExt as _, sync::atomic::Ordering};
+
+		// SAFETY: the hook only reads a thread-local and bumps an atomic, which is
+		// safe in the forking thread; registering it has no other effect.
+		assert_eq!(unsafe { libc::pthread_atfork(Some(count_host_fork), None, None) }, 0);
+
+		let dir = tempfile::tempdir().expect("temp dir");
+		let tool = dir.path().join("relative-tool");
+		std::fs::write(&tool, "#!/bin/sh\necho \"relative:$1\"\n").expect("write tool");
+		std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).expect("chmod tool");
+		let cwd = dir.path().to_string_lossy().into_owned();
+
+		let cases: [(&str, &str); 5] = [
+			// `setsid` — the spawn every bash tool command took in the crashed host.
+			("/bin/sh -c 'echo plain'", "plain\n"),
+			// A descriptor beyond stdio.
+			("/bin/sh -c 'echo fd3 >&3' 3>&1", "fd3\n"),
+			// A pipeline of external stages.
+			("/bin/sh -c 'printf \"a\\nb\\n\"' | /usr/bin/wc -l | /usr/bin/tr -d ' '", "2\n"),
+			// A relative program resolved against the shell's cwd.
+			("./relative-tool arg", "relative:arg\n"),
+			// Exported environment reaches the child.
+			("FOO=bar /bin/sh -c 'echo \"$FOO\"'", "bar\n"),
+		];
+
+		let runtime = tokio::runtime::Builder::new_multi_thread()
+			.worker_threads(8)
+			.enable_all()
+			.on_thread_start(|| COUNT_FORKS_ON_THIS_THREAD.with(|count| count.set(true)))
+			.build()
+			.expect("runtime");
+		let outcomes = runtime.block_on(async {
+			let runs: Vec<_> = (0..4)
+				.flat_map(|_| cases.iter())
+				.map(|&(command, expected)| {
+					let cwd = cwd.clone();
+					tokio::spawn(async move {
+						let (tx, rx) = flume::unbounded();
+						let options = ShellExecuteOptions {
+							command: command.to_string(),
+							cwd: Some(cwd),
+							..Default::default()
+						};
+						let result = time::timeout(
+							Duration::from_secs(20),
+							execute_shell(options, Some(tx), CancelToken::default()),
+						)
+						.await
+						.expect("command timed out")
+						.expect("execute_shell");
+						let mut output = String::new();
+						while let Ok(chunk) = rx.recv_async().await {
+							output.push_str(&chunk);
+						}
+						(command, expected, result.exit_code, output)
+					})
+				})
+				.collect();
+			let mut outcomes = Vec::with_capacity(runs.len());
+			for run in runs {
+				outcomes.push(run.await.expect("run task panicked"));
+			}
+			outcomes
+		});
+
+		for (command, expected, exit_code, output) in outcomes {
+			assert_eq!(exit_code, Some(0), "{command:?} failed; output: {output:?}");
+			assert_eq!(output, expected, "{command:?} produced unexpected output");
+		}
+		assert_eq!(
+			HOST_FORKS.load(Ordering::SeqCst),
+			0,
+			"launching external commands fork()ed the multi-threaded host; a concurrent \
+			 MallocStackLogging registration would abort it (oh-my-pi#11)",
+		);
+	}
+
 	#[cfg(unix)]
 	#[tokio::test(flavor = "multi_thread")]
 	async fn wait_accepts_last_background_process_id() {

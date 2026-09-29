@@ -30,4 +30,6 @@ pub mod fs;
 pub use platform::{
 	PlatformError, async_pipe, commands, fd, input, poll, process, resource, signal, terminal,
 };
+#[cfg(target_os = "macos")]
+pub use platform::spawn;
 pub(crate) use platform::{env, network, users};

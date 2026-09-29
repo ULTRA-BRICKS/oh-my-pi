@@ -382,6 +382,15 @@ fn run_pty_sync(
 	ct.heartbeat()
 		.map_err(|err| Error::from_reason(format!("PTY setup cancelled before spawn: {err}")))?;
 
+	#[cfg(target_os = "macos")]
+	let mut child: Box<dyn Child + Send + Sync> = match pair.master.tty_name() {
+		Some(tty) => Box::new(
+			posix_spawn_pty::spawn_command(&cmd, &tty)
+				.map_err(|err| Error::from_reason(format!("Failed to spawn PTY command: {err}")))?,
+		),
+		None => return Err(Error::from_reason("Failed to spawn PTY command: PTY has no tty name")),
+	};
+	#[cfg(not(target_os = "macos"))]
 	let mut child = pair
 		.slave
 		.spawn_command(cmd)
@@ -766,6 +775,173 @@ fn await_pty_output_drain(
 	}
 }
 
+/// Fork-free PTY launch for macOS.
+///
+/// `portable_pty`'s `spawn_command` prepares the child in a `pre_exec` hook, so
+/// `std` falls back to `fork()`, which can get the multi-threaded host killed
+/// with `SIGKILL` (see `brush_core::sys::spawn`, oh-my-pi#11). This starts the
+/// same command with `posix_spawn`: a new session whose controlling terminal is
+/// the PTY slave, opened as stdin/stdout/stderr, the same signal reset, and no
+/// other inherited descriptors — what `portable_pty` sets up after its fork.
+#[cfg(target_os = "macos")]
+mod posix_spawn_pty {
+	use std::{
+		ffi::{CString, OsStr},
+		io,
+		os::unix::ffi::OsStrExt as _,
+		path::{Component, Path, PathBuf},
+	};
+
+	use brush_core::sys::spawn::{self, SessionSetup, SpawnRequest};
+	use portable_pty::{ChildKiller, CommandBuilder, ExitStatus};
+
+	/// Signals `portable_pty` resets to their default disposition in the child.
+	const DEFAULT_SIGNALS: [libc::c_int; 6] =
+		[libc::SIGCHLD, libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM, libc::SIGALRM];
+
+	/// Starts `cmd` on the PTY whose slave device is `tty`, resolving the
+	/// program, working directory and environment as `portable_pty` does.
+	pub(super) fn spawn_command(cmd: &CommandBuilder, tty: &Path) -> io::Result<PtyChild> {
+		let argv = cmd.get_argv();
+		let Some(argv0) = argv.first() else {
+			return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty PTY command"));
+		};
+		let cwd = working_dir(cmd);
+		let program = resolve_program(cmd, argv0, &cwd)?;
+
+		let mut request = SpawnRequest::new(program, argv0);
+		for arg in &argv[1..] {
+			request.arg(arg);
+		}
+		request.cwd(&cwd);
+		let mut has_shell = false;
+		for (key, value) in cmd.iter_full_env_as_str() {
+			has_shell |= key == "SHELL";
+			request.env(key, value);
+		}
+		if !has_shell {
+			request.env("SHELL", cmd.get_shell());
+		}
+		for fd in 0..=2 {
+			request.open(fd, tty, libc::O_RDWR);
+		}
+		for signal in DEFAULT_SIGNALS {
+			request.default_signal(signal);
+		}
+		request
+			.session(SessionSetup::NewSession)
+			.close_unmapped_fds();
+		spawn::spawn(request).map(PtyChild)
+	}
+
+	/// The requested working directory when it is a directory, else `$HOME`.
+	fn working_dir(cmd: &CommandBuilder) -> PathBuf {
+		cmd.get_cwd()
+			.map(PathBuf::from)
+			.filter(|dir| dir.is_dir())
+			.or_else(|| cmd.get_env("HOME").map(PathBuf::from))
+			.or_else(std::env::home_dir)
+			.unwrap_or_else(|| PathBuf::from("/"))
+	}
+
+	/// Resolves `exe` exactly as `portable_pty`'s `search_path` does, so both
+	/// launch paths accept the same names: absolute paths as given, `./` and
+	/// `../` names against `cwd`, and every other name (even one containing a
+	/// `/`) against each `PATH` entry, itself taken relative to `cwd`.
+	fn resolve_program(cmd: &CommandBuilder, exe: &OsStr, cwd: &Path) -> io::Result<PathBuf> {
+		let exe_path = Path::new(exe);
+		if exe_path.is_absolute() {
+			return Ok(exe_path.to_path_buf());
+		}
+		if matches!(exe_path.components().next(), Some(Component::CurDir | Component::ParentDir)) {
+			return Ok(cwd.join(exe_path));
+		}
+		cmd.get_env("PATH")
+			.into_iter()
+			.flat_map(std::env::split_paths)
+			.map(|dir| cwd.join(dir).join(exe_path))
+			.find(|candidate| !candidate.is_dir() && is_executable(candidate))
+			.ok_or_else(|| {
+				io::Error::new(
+					io::ErrorKind::NotFound,
+					format!("{} not found in PATH", exe_path.display()),
+				)
+			})
+	}
+
+	fn is_executable(path: &Path) -> bool {
+		let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+			return false;
+		};
+		// SAFETY: `access` only reads the NUL-terminated path.
+		unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 }
+	}
+
+	/// A PTY child launched with `posix_spawn`.
+	#[derive(Debug)]
+	pub(super) struct PtyChild(spawn::Child);
+
+	impl ChildKiller for PtyChild {
+		/// Mirrors `portable_pty`'s kill for its own children: SIGHUP, a short
+		/// grace period, then SIGKILL.
+		fn kill(&mut self) -> io::Result<()> {
+			signal_pid(self.0.id(), libc::SIGHUP)?;
+			for attempt in 0..5 {
+				if attempt > 0 {
+					std::thread::sleep(std::time::Duration::from_millis(50));
+				}
+				if let Ok(Some(_)) = self.0.try_wait() {
+					return Ok(());
+				}
+			}
+			signal_pid(self.0.id(), libc::SIGKILL)
+		}
+
+		fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+			Box::new(Hangup(self.0.id()))
+		}
+	}
+
+	impl portable_pty::Child for PtyChild {
+		fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+			Ok(self.0.try_wait()?.map(ExitStatus::from))
+		}
+
+		fn wait(&mut self) -> io::Result<ExitStatus> {
+			self.0.wait_blocking().map(ExitStatus::from)
+		}
+
+		fn process_id(&self) -> Option<u32> {
+			Some(self.0.id())
+		}
+	}
+
+	/// Sends SIGHUP to a PTY child from another thread, like `portable_pty`'s
+	/// cloned killers.
+	#[derive(Debug)]
+	struct Hangup(u32);
+
+	impl ChildKiller for Hangup {
+		fn kill(&mut self) -> io::Result<()> {
+			signal_pid(self.0, libc::SIGHUP)
+		}
+
+		fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+			Box::new(Self(self.0))
+		}
+	}
+
+	fn signal_pid(pid: u32, signal: libc::c_int) -> io::Result<()> {
+		let pid = libc::pid_t::try_from(pid).map_err(io::Error::other)?;
+		// SAFETY: `kill` takes the pid and signal by value.
+		if unsafe { libc::kill(pid, signal) } == 0 {
+			Ok(())
+		} else {
+			Err(io::Error::last_os_error())
+		}
+	}
+}
+
 #[cfg(test)]
 mod reader_queue_tests {
 	use std::{
@@ -1000,6 +1176,73 @@ mod reader_queue_tests {
 		assert!(
 			start.elapsed() < POST_CANCEL_DRAIN_TIMEOUT,
 			"after stop disconnects the pump, cancel must not sit out the full drain timeout",
+		);
+	}
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod posix_spawn_tests {
+	use std::{
+		cell::Cell,
+		sync::atomic::{AtomicUsize, Ordering},
+	};
+
+	use super::*;
+
+	thread_local! {
+		static COUNT_FORKS_ON_THIS_THREAD: Cell<bool> = const { Cell::new(false) };
+	}
+	static HOST_FORKS: AtomicUsize = AtomicUsize::new(0);
+
+	extern "C" fn count_host_fork() {
+		if COUNT_FORKS_ON_THIS_THREAD.with(Cell::get) {
+			HOST_FORKS.fetch_add(1, Ordering::SeqCst);
+		}
+	}
+
+	/// Regression for oh-my-pi#11: a PTY session must start its command without
+	/// `fork()` in the multi-threaded host (a concurrent MallocStackLogging
+	/// registration turns any fork into a host SIGKILL; see
+	/// `brush_core::sys::spawn`), and the command must still get the PTY as
+	/// its stdin and controlling terminal at the requested size. Runs the
+	/// session on a `spawn_blocking` worker of a multi-threaded runtime, as
+	/// `PtySession::start` does.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn pty_sessions_launch_without_forking_the_host() {
+		// SAFETY: the hook only reads a thread-local and bumps an atomic, which is
+		// safe in the forking thread; registering it has no other effect.
+		assert_eq!(unsafe { libc::pthread_atfork(Some(count_host_fork), None, None) }, 0);
+
+		let dir = tempfile::tempdir().expect("temp dir");
+		let report = dir.path().join("report");
+		let (_control_tx, control_rx) = flume::unbounded();
+		let config = PtyRunConfig {
+			command: PtyCommand::Shell {
+				command: format!(
+					"(exec </dev/tty) && echo ctty > '{0}'; stty size >> '{0}'",
+					report.display()
+				),
+				shell:   Some("/bin/sh".to_string()),
+			},
+			cwd:     Some(dir.path().to_string_lossy().into_owned()),
+			env:     None,
+			cols:    100,
+			rows:    30,
+		};
+		let result = tokio::task::spawn_blocking(move || {
+			COUNT_FORKS_ON_THIS_THREAD.with(|count| count.set(true));
+			run_pty_sync(config, None, None, control_rx, task::CancelToken::new(None, None))
+		})
+		.await
+		.expect("PTY worker")
+		.expect("PTY run");
+
+		assert_eq!(result.exit_code, Some(0));
+		assert_eq!(std::fs::read_to_string(&report).expect("report"), "ctty\n30 100\n");
+		assert_eq!(
+			HOST_FORKS.load(Ordering::SeqCst),
+			0,
+			"starting a PTY command fork()ed the multi-threaded host (oh-my-pi#11)",
 		);
 	}
 }

@@ -204,29 +204,9 @@ pub fn compose_std_command<S: AsRef<OsStr>, SE: extensions::ShellExtensions>(
 	// Start with a clear environment.
 	cmd.env_clear();
 
-	// Add in exported variables.
+	// Add in exported variables and functions.
 	if !empty_env {
-		for (k, v) in context.shell.env().iter_exported() {
-			// NOTE: To match bash behavior, we only include exported variables
-			// that are set (i.e., have a value). This means a variable that
-			// shows up in `declare -p` but has no *set* value will be omitted.
-			if v.value().is_set() {
-				cmd.env(k.as_str(), v.value().to_cow_str(context.shell).as_ref());
-			}
-		}
-		// Set _ to the resolved command path for external commands.
-		cmd.env("_", command_name);
-	}
-
-	// Add in exported functions.
-	if !empty_env {
-		for (func_name, registration) in context.shell.funcs().iter() {
-			if registration.is_exported() {
-				let var_name = std::format!("BASH_FUNC_{func_name}%%");
-				let value = std::format!("() {}", registration.definition().body);
-				cmd.env(var_name, value);
-			}
-		}
+		cmd.envs(external_command_env(context, command_name));
 	}
 
 	// Redirect stdin, if applicable.
@@ -263,6 +243,32 @@ pub fn compose_std_command<S: AsRef<OsStr>, SE: extensions::ShellExtensions>(
 	cmd.inject_fds(other_files)?;
 
 	Ok(cmd)
+}
+
+/// The environment an external command receives: exported variables that are
+/// set (a variable that shows up in `declare -p` but has no value is omitted,
+/// as in bash), `_` set to the resolved command path, and exported functions.
+/// Keys are unique: an exported `_` is replaced by the command path.
+fn external_command_env<SE: extensions::ShellExtensions>(
+	context: &ExecutionContext<'_, SE>,
+	command_name: &str,
+) -> Vec<(String, String)> {
+	let mut env = Vec::new();
+	for (k, v) in context.shell.env().iter_exported() {
+		if k != "_" && v.value().is_set() {
+			env.push((k.clone(), v.value().to_cow_str(context.shell).into_owned()));
+		}
+	}
+	env.push(("_".to_owned(), command_name.to_owned()));
+	for (func_name, registration) in context.shell.funcs().iter() {
+		if registration.is_exported() {
+			env.push((
+				std::format!("BASH_FUNC_{func_name}%%"),
+				std::format!("() {}", registration.definition().body),
+			));
+		}
+	}
+	env
 }
 
 pub(crate) async fn on_preexecute(
@@ -629,81 +635,30 @@ pub(crate) fn execute_external_command(
 	let new_pg = matches!(context.params.process_group_policy, ProcessGroupPolicy::NewProcessGroup);
 	let session_action = child_session_action(new_pg, child_stdin_is_terminal, in_pipeline);
 
-	// Compose the std::process::Command that encapsulates what we want to launch.
-	// argv[0] defaults to context.command_name (the user-facing name of the
-	// command) unless the caller specified an explicit override.
+	// Compose what we want to launch. argv[0] defaults to context.command_name
+	// (the user-facing name of the command) unless the caller specified an
+	// explicit override.
 	let argv0 = argv0_override.unwrap_or(context.command_name.as_str());
-	#[allow(unused_mut, reason = "only mutated on unix platforms")]
-	let mut cmd = compose_std_command(
+	let launch = compose_external_launch(
 		&context,
 		executable_path,
 		argv0,
 		cmd_args.as_slice(),
-		false, /* empty environment? */
+		session_action,
+		new_pg,
+		process_group_id,
 	)?;
 	let mut marker_output = prepare_output_markers(&context, executable_path, cmd_args.as_slice());
-
-
-	// Set up process group/session state.
-	//
-	// A child we are about to `setsid()` (`DetachSession`) must NOT also be
-	// handed a `process_group(...)`. For a would-be new-group leader it would
-	// duplicate the group `setsid` already creates; for a pipeline stage joining
-	// an established group it is a cross-session `setpgid` that fails with EPERM
-	// now that the leader (and every prior stage) has moved into its own session.
-	// In both cases `setsid` alone gives the child its own session and process
-	// group. See `child_session_action` for the decision rationale.
-	let command_leads_session = new_pg
-		&& matches!(session_action, ChildSessionAction::TakeForeground)
-		&& context.shell.options().external_cmd_leads_session;
-
-	match session_action {
-		ChildSessionAction::DetachSession => {
-			// setsid() creates the fresh session + process group; no process_group().
-			// A reparenting operand (`nohup cmd &`) additionally double-forks so it
-			// leaves the host's descendant tree and survives the teardown walk.
-			if context.params.detach_reparent {
-				cmd.detach_session_reparent();
-			} else {
-				cmd.detach_session();
-			}
-		}
-		ChildSessionAction::TakeForeground if command_leads_session => {
-			// Don't set process_group(0) - setsid() in pre_exec will handle it.
-			cmd.lead_session();
-		}
-		ChildSessionAction::TakeForeground => {
-			// Foreground a child that is not leading its own session: create/join
-			// the process group in the current session, then grab the terminal.
-			if new_pg {
-				cmd.process_group(0);
-			} else if let Some(pgid) = process_group_id {
-				cmd.process_group(pgid);
-			}
-			cmd.take_foreground();
-		}
-		ChildSessionAction::None => {
-			// Normal case: create a new process group in the current session, or
-			// join an established one (later pipeline stages).
-			if new_pg {
-				cmd.process_group(0);
-			} else if let Some(pgid) = process_group_id {
-				cmd.process_group(pgid);
-			}
-		}
-	}
 
 	// When tracing is enabled, report.
 	tracing::debug!(
 		 target: trace_categories::COMMANDS,
 		 "Spawning: cmd='{} {}'",
-		 cmd.get_program().to_string_lossy().to_string(),
-		 cmd.get_args()
-			  .map(|a| a.to_string_lossy().to_string())
-			  .join(" ")
+		 executable_path,
+		 cmd_args.iter().join(" ")
 	);
 
-	match sys::process::spawn(cmd) {
+	match launch.spawn() {
 		Ok(child) => {
 			// Retrieve the pid.
 			#[expect(clippy::cast_possible_wrap)]
@@ -761,6 +716,156 @@ pub(crate) fn execute_external_command(
 			}
 		},
 	}
+}
+
+/// How an external command gets launched.
+enum ExternalLaunch {
+	/// Through `std::process::Command`, which falls back to `fork()` when a
+	/// `pre_exec` hook is registered.
+	Std(std::process::Command),
+	/// Through `posix_spawn`, which never forks the host; see
+	/// [`sys::spawn`] for why that matters on macOS.
+	#[cfg(target_os = "macos")]
+	PosixSpawn(sys::spawn::SpawnRequest),
+}
+
+impl ExternalLaunch {
+	fn spawn(self) -> io::Result<sys::process::Child> {
+		match self {
+			Self::Std(cmd) => sys::process::spawn(cmd),
+			#[cfg(target_os = "macos")]
+			Self::PosixSpawn(request) => sys::spawn::spawn(request).map(sys::process::Child::Spawned),
+		}
+	}
+}
+
+#[allow(unused_mut, reason = "`cmd` is only mutated on unix platforms")]
+fn compose_external_launch<SE: extensions::ShellExtensions>(
+	context: &ExecutionContext<'_, SE>,
+	executable_path: &str,
+	argv0: &str,
+	args: &[&String],
+	session_action: ChildSessionAction,
+	new_pg: bool,
+	process_group_id: Option<i32>,
+) -> Result<ExternalLaunch, error::Error> {
+	#[cfg(target_os = "macos")]
+	if let Some(session) =
+		posix_spawn_session(session_action, context.params.detach_reparent, new_pg, process_group_id)
+	{
+		return compose_spawn_request(context, executable_path, argv0, args, session)
+			.map(ExternalLaunch::PosixSpawn);
+	}
+
+	let mut cmd = compose_std_command(context, executable_path, argv0, args, false)?;
+
+	// Set up process group/session state.
+	//
+	// A child we are about to `setsid()` (`DetachSession`) must NOT also be
+	// handed a `process_group(...)`. For a would-be new-group leader it would
+	// duplicate the group `setsid` already creates; for a pipeline stage joining
+	// an established group it is a cross-session `setpgid` that fails with EPERM
+	// now that the leader (and every prior stage) has moved into its own session.
+	// In both cases `setsid` alone gives the child its own session and process
+	// group. See `child_session_action` for the decision rationale.
+	let command_leads_session = new_pg
+		&& matches!(session_action, ChildSessionAction::TakeForeground)
+		&& context.shell.options().external_cmd_leads_session;
+
+	match session_action {
+		ChildSessionAction::DetachSession => {
+			// setsid() creates the fresh session + process group; no process_group().
+			// A reparenting operand (`nohup cmd &`) additionally double-forks so it
+			// leaves the host's descendant tree and survives the teardown walk.
+			if context.params.detach_reparent {
+				cmd.detach_session_reparent();
+			} else {
+				cmd.detach_session();
+			}
+		},
+		ChildSessionAction::TakeForeground if command_leads_session => {
+			// Don't set process_group(0) - setsid() in pre_exec will handle it.
+			cmd.lead_session();
+		},
+		ChildSessionAction::TakeForeground => {
+			// Foreground a child that is not leading its own session: create/join
+			// the process group in the current session, then grab the terminal.
+			if new_pg {
+				cmd.process_group(0);
+			} else if let Some(pgid) = process_group_id {
+				cmd.process_group(pgid);
+			}
+			cmd.take_foreground();
+		},
+		ChildSessionAction::None => {
+			// Normal case: create a new process group in the current session, or
+			// join an established one (later pipeline stages).
+			if new_pg {
+				cmd.process_group(0);
+			} else if let Some(pgid) = process_group_id {
+				cmd.process_group(pgid);
+			}
+		},
+	}
+
+	Ok(ExternalLaunch::Std(cmd))
+}
+
+/// The `posix_spawn` session setup for `session_action`, or `None` when the
+/// launch needs a `pre_exec` hook that `posix_spawn` cannot express: taking
+/// the terminal foreground (`tcsetpgrp` in the child, interactive shells only)
+/// and `nohup cmd &`'s double fork.
+#[cfg(target_os = "macos")]
+const fn posix_spawn_session(
+	session_action: ChildSessionAction,
+	detach_reparent: bool,
+	new_pg: bool,
+	process_group_id: Option<i32>,
+) -> Option<sys::spawn::SessionSetup> {
+	use sys::spawn::SessionSetup;
+
+	match session_action {
+		ChildSessionAction::DetachSession if detach_reparent => None,
+		ChildSessionAction::DetachSession => Some(SessionSetup::NewSession),
+		ChildSessionAction::TakeForeground => None,
+		ChildSessionAction::None if new_pg => Some(SessionSetup::ProcessGroup(0)),
+		ChildSessionAction::None => match process_group_id {
+			Some(pgid) => Some(SessionSetup::ProcessGroup(pgid)),
+			None => Some(SessionSetup::Inherit),
+		},
+	}
+}
+
+/// The `posix_spawn` counterpart of [`compose_std_command`]: same program,
+/// argv, working directory, environment and descriptors.
+#[cfg(target_os = "macos")]
+fn compose_spawn_request<SE: extensions::ShellExtensions>(
+	context: &ExecutionContext<'_, SE>,
+	executable_path: &str,
+	argv0: &str,
+	args: &[&String],
+	session: sys::spawn::SessionSetup,
+) -> Result<sys::spawn::SpawnRequest, error::Error> {
+	let mut request = sys::spawn::SpawnRequest::new(executable_path, argv0);
+	for arg in args {
+		request.arg(arg.as_str());
+	}
+	request.cwd(context.shell.working_dir());
+	for (key, value) in external_command_env(context, executable_path) {
+		request.env(key, value);
+	}
+	for fd in [OpenFiles::STDIN_FD, OpenFiles::STDOUT_FD, OpenFiles::STDERR_FD] {
+		if let Some(file) = context.try_fd(fd) {
+			request.fd(fd, file.try_clone_to_owned()?);
+		}
+	}
+	for (fd, file) in context.iter_fds().filter(|(fd, _)| {
+		*fd != OpenFiles::STDIN_FD && *fd != OpenFiles::STDOUT_FD && *fd != OpenFiles::STDERR_FD
+	}) {
+		request.fd(fd, file.try_clone_to_owned()?);
+	}
+	request.session(session);
+	Ok(request)
 }
 
 fn prepare_output_markers<SE: extensions::ShellExtensions>(

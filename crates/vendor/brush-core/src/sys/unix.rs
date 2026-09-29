@@ -7,7 +7,12 @@ pub mod input;
 pub(crate) mod network;
 pub mod poll;
 use crate::error;
+#[cfg(target_os = "macos")]
+pub mod process;
+#[cfg(not(target_os = "macos"))]
 pub use crate::sys::tokio_process as process;
+#[cfg(target_os = "macos")]
+pub mod spawn;
 pub mod resource;
 pub mod signal;
 pub mod terminal;
