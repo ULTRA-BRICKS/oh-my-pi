@@ -1,4 +1,6 @@
 pub mod cancel;
+#[cfg(unix)]
+pub mod lifeline;
 pub mod minimizer;
 pub mod output_decode;
 pub mod process;

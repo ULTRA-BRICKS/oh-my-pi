@@ -695,6 +695,15 @@ export function getSshControlDir(): string {
 	return dirs.rootSubdir("ssh-control", "state");
 }
 
+/**
+ * Get the process-lifeline record directory (~/.omp/lifeline): one record per
+ * running omp process listing the commands its shell spawned, so they can be
+ * reaped after that process dies without cleaning up.
+ */
+export function getLifelineDir(): string {
+	return dirs.rootSubdir("lifeline", "state");
+}
+
 /** Get the remote host info directory (~/.omp/remote-host). */
 export function getRemoteHostDir(): string {
 	return dirs.rootSubdir("remote-host", "data");

@@ -34,6 +34,7 @@ import {
 	BLOB_BROKER_WORKER_ARG,
 	COMPUTER_WORKER_ARG,
 	DAEMON_BROKER_WORKER_ARG,
+	LIFELINE_REAP_WORKER_ARG,
 	LSP_MUX_WORKER_ARG,
 	STATS_ACTIVITY_WORKER_ARG,
 	TERMINAL_OUTPUT_WORKER_ARG,
@@ -182,7 +183,7 @@ const STT_WORKER_ARG = "__omp_worker_stt";
 const TTS_WORKER_ARG = "__omp_worker_tts";
 const MNEMOPI_EMBED_WORKER_ARG = "__omp_worker_mnemopi_embed";
 
-async function runWorkerEntrypoint(arg: string | undefined): Promise<boolean> {
+async function runWorkerEntrypoint(arg: string | undefined, args: string[]): Promise<boolean> {
 	if (arg === TINY_WORKER_ARG) {
 		await runTinyWorker();
 		return true;
@@ -290,6 +291,12 @@ async function runWorkerEntrypoint(arg: string | undefined): Promise<boolean> {
 	if (arg === BLOB_BROKER_WORKER_ARG) {
 		const { startBlobBrokerFromEnvironment } = await import("./blob-broker/server");
 		await startBlobBrokerFromEnvironment();
+		return true;
+	}
+	if (arg === LIFELINE_REAP_WORKER_ARG) {
+		// Worker selectors must dispatch before the normal command graph loads.
+		const { runLifelineReaper } = await import("./exec/lifeline");
+		await runLifelineReaper(args);
 		return true;
 	}
 	return false;
@@ -526,7 +533,10 @@ export async function runCli(argv: string[]): Promise<void> {
 	if (isWorkerHostSelector(resolvedArgv[0])) {
 		// Invoke dispatch first so its inbox is installed before asynchronous
 		// process-name setup yields; neither dependency belongs in prepaint.
-		const [dispatched] = await Promise.all([runWorkerEntrypoint(resolvedArgv[0]), setFullProcessName()]);
+		const [dispatched] = await Promise.all([
+			runWorkerEntrypoint(resolvedArgv[0], resolvedArgv.slice(1)),
+			setFullProcessName(),
+		]);
 		if (!dispatched) {
 			process.stderr.write(`Error: unknown worker selector: ${resolvedArgv[0]}\n`);
 			process.exitCode = 1;

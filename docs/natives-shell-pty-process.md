@@ -262,26 +262,29 @@ Layout behavior:
 
 ### Shell + PTY + Process
 
-| JS API                                       | Rust N-API export                  | Notes                                            |
-| -------------------------------------------- | ---------------------------------- | ------------------------------------------------ |
-| `executeShell(options, onChunk?)`            | `executeShell` (`execute_shell`)   | One-shot shell execution                         |
-| `new Shell(options?)`                        | `Shell` class                      | Persistent shell session                         |
-| `shell.run(options, onChunk?)`               | `Shell::run`                       | Reuses session on keepalive control flow         |
-| `shell.abort()`                              | `Shell::abort`                     | Aborts active run for that shell instance        |
-| `shell.liveBackgroundJobCount()`             | `Shell::live_background_job_count` | Reaps jobs, then counts live background children |
-| `new PtySession()`                           | `PtySession` class                 | Stateful PTY session                             |
-| `pty.start(options, onChunk?, onStart?)`     | `PtySession::start`                | Shell-command PTY run                            |
-| `pty.startArgv(options, onChunk?, onStart?)` | `PtySession::start_argv`           | Direct executable/argv PTY run                   |
-| `pty.write(data)`                            | `PtySession::write`                | Raw stdin passthrough                            |
-| `pty.resize(cols, rows)`                     | `PtySession::resize`               | Clamped terminal dimensions                      |
-| `pty.kill()`                                 | `PtySession::kill`                 | Terminates active PTY child/targets              |
-| `Process.fromPid(pid)`                       | `Process::from_pid`                | Stable process reference lookup                  |
-| `Process.fromPath(path)`                     | `Process::from_path`               | Executable-path process lookup                   |
-| `process.killTree(signal?)`                  | `Process::kill_tree`               | Children-first process tree termination          |
-| `process.terminate(options?)`                | `Process::terminate`               | Graceful then hard process termination           |
-| `process.waitForExit(options?)`              | `Process::wait_for_exit`           | Async exit wait                                  |
-| `process.children()`                         | `Process::children`                | Direct children as `Process[]`                   |
-| `process.status()`                           | `Process::status`                  | `running` / `exited`                             |
+| JS API                                       | Rust N-API export                  | Notes                                                |
+| -------------------------------------------- | ---------------------------------- | ---------------------------------------------------- |
+| `executeShell(options, onChunk?)`            | `executeShell` (`execute_shell`)   | One-shot shell execution                             |
+| `new Shell(options?)`                        | `Shell` class                      | Persistent shell session                             |
+| `shell.run(options, onChunk?)`               | `Shell::run`                       | Reuses session on keepalive control flow             |
+| `shell.abort()`                              | `Shell::abort`                     | Aborts active run for that shell instance            |
+| `shell.liveBackgroundJobCount()`             | `Shell::live_background_job_count` | Reaps jobs, then counts live background children     |
+| `new PtySession()`                           | `PtySession` class                 | Stateful PTY session                                 |
+| `pty.start(options, onChunk?, onStart?)`     | `PtySession::start`                | Shell-command PTY run                                |
+| `pty.startArgv(options, onChunk?, onStart?)` | `PtySession::start_argv`           | Direct executable/argv PTY run                       |
+| `pty.write(data)`                            | `PtySession::write`                | Raw stdin passthrough                                |
+| `pty.resize(cols, rows)`                     | `PtySession::resize`               | Clamped terminal dimensions                          |
+| `pty.kill()`                                 | `PtySession::kill`                 | Terminates active PTY child/targets                  |
+| `Process.fromPid(pid)`                       | `Process::from_pid`                | Stable process reference lookup                      |
+| `Process.fromPath(path)`                     | `Process::from_path`               | Executable-path process lookup                       |
+| `process.killTree(signal?)`                  | `Process::kill_tree`               | Children-first process tree termination              |
+| `process.terminate(options?)`                | `Process::terminate`               | Graceful then hard process termination               |
+| `process.waitForExit(options?)`              | `Process::wait_for_exit`           | Async exit wait                                      |
+| `process.children()`                         | `Process::children`                | Direct children as `Process[]`                       |
+| `process.status()`                           | `Process::status`                  | `running` / `exited`                                 |
+| `lifelineStart(dir, reaper, reaperCwd?)`     | `lifelineStart`                    | Record shell/PTY spawns; start host-death supervisor |
+| `lifelineReapAfterHostExit(dir, record, ms)` | `lifelineReapAfterHostExit`        | Supervisor's reaper: wait for host exit, then sweep  |
+| `lifelineSweep(dir)`                         | `lifelineSweep`                    | Reap what dead hosts' records still own              |
 
 ### Keys
 
@@ -298,3 +301,4 @@ Layout behavior:
 - **Shell persistent session**: if a run is cancelled/timed out/errors/non-keepalive control flow, Rust drops the internal session state. Successful normal runs keep the session for reuse.
 - **PTY session**: `core` is always cleared after `start()` finishes, including failure paths.
 - **No explicit JS finalizer-driven kill contract** is exposed by wrappers; cleanup is primarily tied to run completion/cancellation paths. Callers should use `timeoutMs`, `AbortSignal`, `shell.abort()`, or `pty.kill()` for deterministic teardown.
+- **Host death**: none of the above runs when the host process itself dies without cleanup (`SIGKILL`, native abort). The process lifeline covers that case — see [Bash tool runtime → Host death](./bash-tool-runtime.md#host-death-the-process-lifeline).

@@ -17,6 +17,7 @@ import {
 	setProjectDir,
 	VERSION,
 } from "@oh-my-pi/pi-utils/dirs";
+import type { LifelineReapedHost } from "@oh-my-pi/pi-natives";
 import { $env, isBunTestRuntime, setInteractiveHost } from "@oh-my-pi/pi-utils/env";
 import * as logger from "@oh-my-pi/pi-utils/logger";
 import * as postmortem from "@oh-my-pi/pi-utils/postmortem";
@@ -59,6 +60,7 @@ import { loadExtensions } from "./extensibility/extensions/loader";
 import { ExtensionRunner } from "./extensibility/extensions/runner";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
 import { scheduleMarketplaceAutoUpdate } from "./extensibility/plugins/marketplace-auto-update";
+import { describeReapedHosts, startProcessLifeline } from "./exec/lifeline";
 import { registerDaemonProjectPresence } from "./launch/presence";
 import { discoverStartupLspServers } from "./lsp/servers";
 import type { MCPManager } from "./mcp";
@@ -2063,7 +2065,12 @@ export async function runRootCommand(
 			}
 		}
 		await pluginPreloadPromise;
+		// Before any session runs a command: from here on, commands the bash tool
+		// spawns die with this process however it dies, and leftovers of crashed
+		// omp processes are reaped (reported as a startup warning below).
+		let lifelineReport: Promise<LifelineReapedHost[]> = Promise.resolve([]);
 		if (deps === DEFAULT_RUN_ROOT_DEPENDENCIES) {
+			lifelineReport = startProcessLifeline();
 			await logger.time("registerDaemonProjectPresence", registerDaemonProjectPresence, cwd);
 		}
 
@@ -2332,6 +2339,8 @@ export async function runRootCommand(
 						process.exit(0);
 					}
 				}
+				const reapedNotice = describeReapedHosts(await lifelineReport);
+				if (reapedNotice) notifs.push({ kind: "warn", message: reapedNotice });
 				const startupLease = takeStartupComposerLease();
 				try {
 					stopStartupWatchdog();

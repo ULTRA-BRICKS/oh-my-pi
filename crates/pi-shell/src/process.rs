@@ -273,6 +273,36 @@ mod platform {
 		rest.split_whitespace().nth(19)?.parse().ok()
 	}
 
+	/// Lineage row for `pid` from `/proc/{pid}/stat`.
+	pub fn process_row(pid: i32) -> Option<super::ProcessRow> {
+		let content = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+		// The comm field (between parens) may contain spaces and parens; the
+		// fields after the *last* `)` are: state ppid pgrp session ... and
+		// starttime at index 19.
+		let rest = &content[content.rfind(')')? + 1..];
+		let fields: Vec<&str> = rest.split_whitespace().collect();
+		Some(super::ProcessRow {
+			pid,
+			ppid: fields.get(1)?.parse().ok()?,
+			pgid: fields.get(2)?.parse().ok()?,
+			sid: fields.get(3)?.parse().ok()?,
+			start: fields.get(19)?.parse().ok()?,
+			zombie: matches!(*fields.first()?, "Z" | "X"),
+		})
+	}
+
+	/// Lineage rows for every process visible in `/proc`.
+	pub fn process_table() -> Vec<super::ProcessRow> {
+		let Ok(entries) = fs::read_dir("/proc") else {
+			return Vec::new();
+		};
+		entries
+			.flatten()
+			.filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+			.filter_map(process_row)
+			.collect()
+	}
+
 	fn open_pidfd(pid: i32) -> Option<Arc<OwnedFd>> {
 		// SAFETY: `pidfd_open` takes the PID by value and does not read
 		// caller-owned memory. Flags are zero, which is valid. On success the
@@ -595,6 +625,42 @@ mod platform {
 			}
 		}
 		matches
+	}
+
+	/// `SZOMB` from `<sys/proc.h>`: exited, not yet reaped by its parent.
+	const SZOMB: u32 = 5;
+
+	/// Lineage row for `pid` from libproc plus `getsid`.
+	pub fn process_row(pid: i32) -> Option<super::ProcessRow> {
+		if pid <= 0 {
+			return None;
+		}
+		let info = read_bsdinfo(pid)?;
+		if i32::try_from(info.pbi_pid).ok()? != pid {
+			return None;
+		}
+		// SAFETY: `getsid` takes the pid by value and reads no caller memory.
+		// macOS answers for processes outside the caller's session too.
+		let sid = unsafe { libc::getsid(pid) };
+		Some(super::ProcessRow {
+			pid,
+			ppid: i32::try_from(info.pbi_ppid).unwrap_or(0),
+			pgid: i32::try_from(info.pbi_pgid).unwrap_or(0),
+			sid: sid.max(0),
+			start: info
+				.pbi_start_tvsec
+				.wrapping_mul(1_000_000)
+				.wrapping_add(info.pbi_start_tvusec),
+			zombie: info.pbi_status == SZOMB,
+		})
+	}
+
+	/// Lineage rows for every pid `proc_listallpids` reports.
+	pub fn process_table() -> Vec<super::ProcessRow> {
+		snapshot_all_pids()
+			.into_iter()
+			.filter_map(process_row)
+			.collect()
 	}
 
 	fn read_bsdinfo(pid: i32) -> Option<libc::proc_bsdinfo> {
@@ -1298,6 +1364,36 @@ mod platform {
 
 		matches
 	}
+}
+
+/// Kernel-reported lineage of one process, from a whole-table snapshot
+/// ([`process_table`]) or a single lookup ([`process_row`]).
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessRow {
+	pub pid:    i32,
+	pub ppid:   i32,
+	pub pgid:   i32,
+	pub sid:    i32,
+	/// Opaque start-time stamp; together with `pid` it identifies one process
+	/// across pid reuse.
+	pub start:  u64,
+	/// Exited but not yet reaped by its parent.
+	pub zombie: bool,
+}
+
+/// Lineage row for `pid`, or `None` if no such process exists.
+#[cfg(unix)]
+#[must_use]
+pub fn process_row(pid: i32) -> Option<ProcessRow> {
+	platform::process_row(pid)
+}
+
+/// Lineage rows for every process the caller can see.
+#[cfg(unix)]
+#[must_use]
+pub fn process_table() -> Vec<ProcessRow> {
+	platform::process_table()
 }
 
 /// Stable process reference.

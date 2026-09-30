@@ -1,0 +1,183 @@
+# Linux acceptance for the bash-tool process lifeline (issue #12).
+#
+# packages/coding-agent/test/process-lifeline.test.ts kills a real host process
+# with SIGKILL / abort() and checks that the command tree it started (including
+# a grandchild in its own setsid session) is gone within 5 seconds. The test
+# needs the lifeline API from THIS tree's pi-natives addon, so the job builds the
+# addon from source; a released addon would not have it. Upstream's
+# .github/workflows jobs run their PR tests against the npm release addon and
+# their natives builds need self-hosted runner labels no Forgejo runner offers
+# (see rig.yaml), so this is the only CI job that runs the test with the PR's own
+# native code on Linux.
+#
+# The ubuntu-latest runner has no C compiler (its host executor lacks cc, c++
+# and make), so the job runs in a node:22 Debian bookworm container, pinned by
+# digest: the full node image is built on buildpack-deps and ships gcc, g++,
+# make, perl, git, curl and procps, plus the node that actions/checkout needs.
+# Rust, CMake, Ninja and Bun go into the job's RUNNER_TEMP; those downloads are
+# pinned by version and sha256.
+
+name: process-lifeline-linux
+
+# The two path lists are kept identical by hand: YAML anchors are not portable
+# across Actions implementations.
+on:
+  pull_request:
+    paths:
+      - "crates/pi-natives/**"
+      - "crates/pi-shell/**"
+      - "crates/vendor/brush-core/**"
+      - "packages/natives/**"
+      - "packages/coding-agent/src/exec/**"
+      - "packages/coding-agent/src/cli.ts"
+      - "packages/coding-agent/src/main.ts"
+      - "packages/coding-agent/test/process-lifeline.test.ts"
+      - "packages/coding-agent/test/fixtures/lifeline-host.ts"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".forgejo/workflows/process-lifeline-linux.yml"
+  push:
+    branches: [main]
+    paths:
+      - "crates/pi-natives/**"
+      - "crates/pi-shell/**"
+      - "crates/vendor/brush-core/**"
+      - "packages/natives/**"
+      - "packages/coding-agent/src/exec/**"
+      - "packages/coding-agent/src/cli.ts"
+      - "packages/coding-agent/src/main.ts"
+      - "packages/coding-agent/test/process-lifeline.test.ts"
+      - "packages/coding-agent/test/fixtures/lifeline-host.ts"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".forgejo/workflows/process-lifeline-linux.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUSTUP_VERSION: "1.28.2"
+  RUSTUP_SHA256: "20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c"
+  CMAKE_VERSION: "3.31.8"
+  CMAKE_SHA256: "630615d8e98ac33eba7fbe472626dff5c899c85af3c024585ae109166a6909d0"
+  NINJA_VERSION: "1.12.1"
+  NINJA_SHA256: "6f98805688d19672bd699fbbfa2c2cf0fc054ac3df1f0e6a47664d963d530255"
+  BUN_VERSION: "1.4.2"
+  # bun-linux-x64-baseline.zip: the baseline build runs on CPUs without AVX2.
+  BUN_SHA256: "c678040f14fe0440eb839d37cbd0ce4c051a32da72806ac97de6a6aab6bf728f"
+
+jobs:
+  process-lifeline:
+    name: process lifeline (Linux, this tree's natives)
+    runs-on: ubuntu-latest
+    container:
+      image: node:22.23.3-bookworm@sha256:363e1587494626837fa7f9a23bdb453d13b0ff3c67c705c2805cfc69c2d2fad7
+      # The runner VM has 6 GiB and no swap, but inside a job container
+      # /proc/meminfo shows the whole host, and nothing else caps the job.
+      # Run 29 filled the VM while compiling pi-natives: the log stopped
+      # mid-build and the runner never reported back. The cap keeps ~1 GiB
+      # for the runner and dockerd, so an overrun OOM-kills a process in
+      # this container instead.
+      options: --memory 5g --memory-swap 5g
+    # Room for a cold dev-profile pi-natives build on the 4-CPU, 6 GiB runner.
+    timeout-minutes: 150
+    # In a job container the runner's default shell is `sh -e`, and the steps
+    # use bash (`set -o pipefail`).
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Runner resources and prerequisites
+        run: |
+          set -euo pipefail
+          uname -a
+          echo "cpus: $(nproc)"
+          # cgroup v2 files; "n/a" on a v1 host.
+          echo "job container memory.max: $(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo n/a)"
+          df -h "${RUNNER_TEMP}" .
+          [ "$(uname -m)" = x86_64 ] || { echo "::error::pinned toolchains are x86_64-only, runner is $(uname -m)"; exit 1; }
+          missing=""
+          for tool in cc c++ make perl curl sha256sum tar git ps; do
+            command -v "$tool" >/dev/null || missing="$missing $tool"
+          done
+          [ -z "$missing" ] || { echo "::error::runner lacks:$missing"; exit 1; }
+
+      - name: Install Rust, CMake, Ninja and Bun (job-local)
+        run: |
+          set -euo pipefail
+          tools="${RUNNER_TEMP}/lifeline-tools"
+          mkdir -p "$tools/bin" "$tools/dl"
+          # dl <url> <file name under $tools/dl> <sha256>
+          dl() { curl -fsSL --retry 3 -o "$tools/dl/$2" "$1"; echo "$3  $tools/dl/$2" | sha256sum -c -; }
+
+          dl "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init" rustup-init "$RUSTUP_SHA256"
+          chmod +x "$tools/dl/rustup-init"
+          toolchain="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)"
+          export RUSTUP_HOME="$tools/rustup" CARGO_HOME="$tools/cargo"
+          # Minimal profile: rust-toolchain.toml also lists Windows targets and
+          # rust-analyzer, which this build does not need.
+          "$tools/dl/rustup-init" -y --no-modify-path --profile minimal --default-toolchain "$toolchain"
+
+          dl "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz" cmake.tar.gz "$CMAKE_SHA256"
+          tar -xzf "$tools/dl/cmake.tar.gz" -C "$tools"
+          ln -s "$tools/cmake-${CMAKE_VERSION}-linux-x86_64/bin/cmake" "$tools/bin/cmake"
+
+          dl "https://github.com/ninja-build/ninja/releases/download/v${NINJA_VERSION}/ninja-linux.zip" ninja.zip "$NINJA_SHA256"
+          (cd "$tools/bin" && "$tools/bin/cmake" -E tar xf "$tools/dl/ninja.zip")
+          chmod +x "$tools/bin/ninja"
+
+          dl "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-x64-baseline.zip" bun.zip "$BUN_SHA256"
+          (cd "$tools/dl" && "$tools/bin/cmake" -E tar xf bun.zip)
+          mv "$tools/dl/bun-linux-x64-baseline/bun" "$tools/bin/bun"
+          chmod +x "$tools/bin/bun"
+          rm -rf "$tools/dl"
+
+          {
+            echo "RUSTUP_HOME=$RUSTUP_HOME"
+            echo "CARGO_HOME=$CARGO_HOME"
+            echo "RUSTUP_TOOLCHAIN=$toolchain"
+            echo "CARGO_TARGET_DIR=${RUNNER_TEMP}/lifeline-target"
+          } >> "$GITHUB_ENV"
+          echo "$tools/bin" >> "$GITHUB_PATH"
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Install workspace dependencies
+        run: |
+          set -euo pipefail
+          cargo --version
+          rustc --version
+          cmake --version | head -1
+          echo "ninja $(ninja --version)"
+          echo "bun $(bun --version)"
+          bun install --frozen-lockfile
+
+      - name: Build pi-natives from this tree
+        run: |
+          set -euo pipefail
+          # Keep the build's peak well under the 5 GiB cap: two rustc jobs, no
+          # debuginfo and no incremental state for the workspace crates (the
+          # pi-natives crate itself is the peak; run 31 peaked at 2.8 GB).
+          # The profile is dev-based: dependencies still build at opt-level 2,
+          # and the test measures process cleanup, not addon speed. It is not
+          # `dev` itself because the napi CLI looks for the artifact under
+          # target/<triple>/<profile>/ and cargo writes dev builds to debug/
+          # (run 31: "Failed to copy artifact"); a custom profile's directory
+          # is its name.
+          cg() { cat "/sys/fs/cgroup/$1" 2>/dev/null || echo n/a; }
+          (while sleep 60; do echo "cgroup memory: current $(cg memory.current) peak $(cg memory.peak)"; done) &
+          sampler=$!
+          trap 'kill "$sampler"' EXIT
+          CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 \
+            CARGO_PROFILE_LIFELINE_INHERITS=dev CARGO_PROFILE_LIFELINE_DEBUG=false \
+            OMP_NATIVE_CARGO_PROFILE=lifeline bun --cwd=packages/natives run build
+          ls -la packages/natives/native/*.node
+
+      - name: process-lifeline.test.ts
+        working-directory: packages/coding-agent
+        run: bun test test/process-lifeline.test.ts

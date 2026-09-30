@@ -682,6 +682,12 @@ pub(crate) fn execute_external_command(
 			{
 				observer.on_spawn(pid, actual_pgid);
 			}
+			if !context.params.detach_reparent
+				&& let Some(observer) = crate::interp::global_spawn_observer()
+				&& let Some(pid) = pid
+			{
+				observer.on_spawn(pid, actual_pgid);
+			}
 
 			let mut child_process = processes::ChildProcess::new(child, pid, actual_pgid);
 			if let Some((output, markers)) = marker_output.take() {

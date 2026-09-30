@@ -1992,6 +1992,47 @@ export declare enum KeyEventType {
   Release = 3
 }
 
+/**
+ * Supervisor entry: wait for the host owning `record` to exit, then sweep
+ * `dir`.
+ *
+ * Waits up to `hostExitWaitMs`, then terminates what dead hosts' records in
+ * `dir` still own. Resolves to one entry per host with at least one process
+ * terminated.
+ */
+export declare function lifelineReapAfterHostExit(dir: string, record: string, hostExitWaitMs: number): Promise<Array<LifelineReapedHost>>
+
+/** Processes a sweep terminated on behalf of one dead omp host. */
+export interface LifelineReapedHost {
+  /** Pid the dead host had. */
+  hostPid: number
+  /** Distinct live processes that were signalled. */
+  processes: number
+}
+
+/**
+ * Record this process's shell and PTY spawns and start its host-death
+ * supervisor.
+ *
+ * Records go under `dir`. Once this process has died — including `SIGKILL`
+ * and native aborts, which run no cleanup code — the supervisor runs `reaper`
+ * (an argv, from `reaperCwd` when given, with `dir` and the record path
+ * appended). Idempotent. Returns the record path, or `null` where the
+ * platform has no lifeline support.
+ *
+ * # Errors
+ * Returns an error when the record cannot be created or the supervisor
+ * cannot be spawned.
+ */
+export declare function lifelineStart(dir: string, reaper: Array<string>, reaperCwd?: string | undefined | null): string | null
+
+/**
+ * Terminate what records in `dir` still own for omp hosts that are no longer
+ * alive (a crash that also took the supervisor down). Resolves to one entry
+ * per host with at least one process terminated.
+ */
+export declare function lifelineSweep(dir: string): Promise<Array<LifelineReapedHost>>
+
 export interface LineRange {
   /** 1-indexed inclusive first visible line. */
   startLine: number

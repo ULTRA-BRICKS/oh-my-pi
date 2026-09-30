@@ -168,6 +168,16 @@ Cancellation:
 
 No exception is thrown inside executor for timeout/cancel; it returns structured `BashResult` and lets caller map error semantics.
 
+## Host death: the process lifeline
+
+Every external command runs in its own session, so nothing ties it to the omp process once that process is gone — and `SIGKILL`, a native abort, or an out-of-memory kill runs no cleanup code in the dying process. The lifeline moves ownership outside it (`src/exec/lifeline.ts`, `pi_shell::lifeline`):
+
+- At startup (`runRootCommand`) omp records every command the shell or PTY runner spawns — main session and in-process subagents alike — in `~/.omp/lifeline/<pid>-<start>.lifeline`, and starts a `/bin/sh` supervisor in its own session, reparented away from omp, that blocks on a pipe only omp holds open.
+- However omp dies, the kernel closes that pipe; the supervisor then re-enters the CLI as `__omp_worker_lifeline_reap`, which sends `SIGTERM`, then `SIGKILL`, to each recorded command still alive, every member of the process group and session it leads (even after it exited), and all their descendants — a grandchild that called `setsid` included.
+- Each startup also sweeps records of dead omp processes whose supervisor died with them and shows how many processes it stopped as a startup warning.
+
+Detached work is not owned and survives: `nohup cmd &` (reparented out of the tree and never recorded), a process that starts its own session and reparents away (the double-fork daemon idiom, e.g. the `rig-detached-*` launchers), and launch-tool daemons (`persist: true`), which the daemon broker spawns outside the shell. `cmd & disown` is not a detach: the job is still owned.
+
 ## Interactive PTY path (`runInteractiveBashPty`)
 
 When PTY is enabled, tool runs `runInteractiveBashPty()` which opens an overlay console component and drives a native `PtySession`.
@@ -298,6 +308,7 @@ This component is wired by `CommandController.handleBashCommand()` and fed from 
 - [`src/exec/bash-executor.ts`](../packages/coding-agent/src/exec/bash-executor.ts) — non-PTY executor, shell session reuse, cancellation wiring, output sink integration.
 - [`src/exec/non-interactive-env.ts`](../packages/coding-agent/src/exec/non-interactive-env.ts) — non-interactive child-process env defaults (`buildNonInteractiveEnv`) used by the non-PTY executor.
 - [`src/exec/direnv.ts`](../packages/coding-agent/src/exec/direnv.ts) — direnv/devenv environment loading used by executor preflight.
+- [`src/exec/lifeline.ts`](../packages/coding-agent/src/exec/lifeline.ts) — process lifeline start, startup sweep, and the supervisor's reaper entry; the recorder, supervisor, and reaper live in [`crates/pi-shell/src/lifeline.rs`](../crates/pi-shell/src/lifeline.rs).
 - [`src/tools/bash-interactive.ts`](../packages/coding-agent/src/tools/bash-interactive.ts) — PTY runtime, overlay UI, input normalization, and interactive `TERM` setup.
 - [`src/session/streaming-output.ts`](../packages/coding-agent/src/session/streaming-output.ts) — `OutputSink`, `TailBuffer`, truncation/artifact spill, and summary metadata.
 - [`src/tools/output-meta.ts`](../packages/coding-agent/src/tools/output-meta.ts) — truncation metadata shape + notice injection wrapper.

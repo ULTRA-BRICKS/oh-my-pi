@@ -398,6 +398,9 @@ fn run_pty_sync(
 	drop(pair.slave);
 	let child_process_id = child.process_id();
 	let child_pid = child_process_id.and_then(|value| i32::try_from(value).ok());
+	if let Some(pid) = child_pid {
+		crate::lifeline::record_spawn(pid);
+	}
 	if let Some(callback) = on_start.as_ref() {
 		callback.call(Ok(child_process_id.unwrap_or(0)), ThreadsafeFunctionCallMode::NonBlocking);
 	}

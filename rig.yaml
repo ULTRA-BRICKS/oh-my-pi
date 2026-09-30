@@ -26,3 +26,6 @@ ci:
     secret-scan:
       enabled: true
       tier: block
+  # The repo's own workflow (not a catalog gate): Linux acceptance for the
+  # process lifeline, built from this tree's natives. See the workflow header.
+  known: [process-lifeline-linux]

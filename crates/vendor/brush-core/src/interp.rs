@@ -2,7 +2,7 @@ use std::{
 	collections::VecDeque,
 	io::Write,
 	path::{Path, PathBuf},
-	sync::Arc,
+	sync::{Arc, OnceLock},
 };
 
 use brush_parser::ast::{self, CommandPrefixOrSuffixItem};
@@ -80,6 +80,23 @@ pub trait SpawnObserver: Send + Sync {
 	/// Reports a freshly spawned external child. `pgid` is the child's process
 	/// group id when known (always its own pid under `NewProcessGroup`).
 	fn on_spawn(&self, pid: i32, pgid: Option<i32>);
+}
+
+/// Process-wide observer that sees every external child the shell spawns,
+/// independent of the per-run [`ExecutionParameters::set_spawn_observer`] hook
+/// (which builtins such as `timeout` replace for their own children).
+static GLOBAL_SPAWN_OBSERVER: OnceLock<Arc<dyn SpawnObserver>> = OnceLock::new();
+
+/// Installs the process-wide spawn observer. Like the per-run hook it is not
+/// called for reparented launches (`detach_reparent`). Only the first install
+/// takes effect; returns `false` if an observer was already installed.
+pub fn set_global_spawn_observer(observer: Arc<dyn SpawnObserver>) -> bool {
+	GLOBAL_SPAWN_OBSERVER.set(observer).is_ok()
+}
+
+/// Returns the process-wide spawn observer, if one was installed.
+pub(crate) fn global_spawn_observer() -> Option<&'static Arc<dyn SpawnObserver>> {
+	GLOBAL_SPAWN_OBSERVER.get()
 }
 
 /// Parameters for execution.
