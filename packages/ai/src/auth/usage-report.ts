@@ -227,6 +227,56 @@ export function reserveUsageLimits(
 	});
 }
 
+/**
+ * Age past which a usage snapshot stops vouching for spare quota. The usage
+ * cache keeps a last-good report for 24h through fetch failures, and a broker
+ * can serve its own retained copy, so a report's age is the only honest signal
+ * of how much to trust its numbers.
+ */
+export const USAGE_RANKING_MAX_AGE_MS = 15 * 60_000;
+/** A report stamped further in the future than this is clock-skewed or malformed and counts as unverifiable. */
+export const USAGE_FETCHED_AT_SKEW_MS = 60_000;
+
+/** True when a report's `fetchedAt` cannot vouch for freshness: invalid, future-dated, or older than `maxAgeMs`. */
+export function isUsageReportOlderThan(report: UsageReport, maxAgeMs: number, nowMs: number): boolean {
+	if (!Number.isFinite(report.fetchedAt) || report.fetchedAt - nowMs > USAGE_FETCHED_AT_SKEW_MS) return true;
+	return nowMs - report.fetchedAt > maxAgeMs;
+}
+
+/**
+ * View of a usage report that is safe to rank or block on. Drops every limit
+ * whose window reset after the snapshot was taken (its numbers describe a
+ * window that no longer exists, exhausted or not). When the snapshot itself is
+ * old, also drops limits that claim headroom: exhaustion stays valid until its
+ * reset, spare quota does not. Returns null when nothing trustworthy is left,
+ * so callers treat the account as unmeasured rather than as 0% used.
+ */
+export function usageForRanking(report: UsageReport | null, nowMs: number): UsageReport | null {
+	if (!report) return null;
+	const snapshotIsOld = isUsageReportOlderThan(report, USAGE_RANKING_MAX_AGE_MS, nowMs);
+	const limits = report.limits.filter(limit => {
+		const resetsAt = windowResetAt(limit.window);
+		// An incremental timestamp ("tick", "regen") is one regeneration step, not a full window reset.
+		const fullReset = limit.window?.resetLabel === undefined || limit.window.resetLabel === "resets";
+		if (fullReset && resetsAt !== undefined && resetsAt <= nowMs && !(report.fetchedAt >= resetsAt)) return false;
+		return !snapshotIsOld || isUsageLimitExhausted(limit);
+	});
+	if (limits.length === 0) return null;
+	return limits.length === report.limits.length ? report : { ...report, limits };
+}
+
+/** Scoped limits that are still trustworthy at `nowMs`; empty when the snapshot proves nothing. */
+export function liveScopedUsageLimits(
+	strategy: CredentialRankingStrategy | undefined,
+	report: UsageReport,
+	context: CredentialRankingContext,
+	nowMs: number,
+): UsageLimit[] {
+	const live = usageForRanking(report, nowMs);
+	if (!live) return [];
+	return strategy ? scopedUsageLimits(strategy, live, context) : live.limits;
+}
+
 /** Measure currently available quota outside expired windows. */
 export function remainingUsageFraction(
 	strategy: CredentialRankingStrategy | undefined,

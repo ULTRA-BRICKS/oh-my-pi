@@ -42,6 +42,7 @@ import type { AuthCredential, OAuthCredential, ObservedUsageInput, UsageApi } fr
 import {
 	dedupeUsageReports,
 	isUsageLimitExhausted,
+	isUsageReportOlderThan,
 	scopedUsageLimits,
 	usageReportMetadataValue,
 	usageReportScopeAccountId,
@@ -101,6 +102,12 @@ export interface UsageServiceDeps {
 	fetch: typeof fetch;
 	requestTimeoutMs: number;
 	logger: UsageLogger;
+}
+
+/** True when a cached report is older than the caller tolerates; a cached null never is. */
+function isReportOlderThan(report: UsageReport | null, maxAgeMs: number | undefined, nowMs: number): boolean {
+	if (!report || maxAgeMs === undefined) return false;
+	return isUsageReportOlderThan(report, maxAgeMs, nowMs);
 }
 
 /** Usage reports: per-credential cached fetches, aggregate reports, header ingestion, history. */
@@ -300,7 +307,7 @@ export class UsageService implements UsageApi {
 	/** Cache a credential report with jitter and failure cooldown. */
 	async #fetchUsageCached(
 		request: UsageRequestDescriptor,
-		options: { timeoutMs?: number; forceRefresh?: boolean } = {},
+		options: { timeoutMs?: number; forceRefresh?: boolean; maxAgeMs?: number } = {},
 	): Promise<UsageReport | null> {
 		const timeoutMs = options.timeoutMs;
 		const forceRefresh = options.forceRefresh ?? false;
@@ -309,7 +316,7 @@ export class UsageService implements UsageApi {
 		const now = Date.now();
 		const cached = forceRefresh ? undefined : this.#deps.cache.get<UsageReport | null>(cacheKey);
 		// Fresh cache hit: return whatever's there (success or null fallback).
-		if (cached && cached.expiresAt > now) {
+		if (cached && cached.expiresAt > now && !isReportOlderThan(cached.value, options.maxAgeMs, now)) {
 			return cached.value;
 		}
 
@@ -618,7 +625,7 @@ export class UsageService implements UsageApi {
 	async report(
 		provider: Provider,
 		credential: AuthCredential,
-		options?: { baseUrl?: string; timeoutMs?: number; signal?: AbortSignal },
+		options?: { baseUrl?: string; timeoutMs?: number; signal?: AbortSignal; maxAgeMs?: number },
 	): Promise<UsageReport | null> {
 		// Store-level hook (e.g. `RemoteAuthCredentialStore`) is authoritative
 		// when present for OAuth: the broker already aggregates usage from a
@@ -644,6 +651,7 @@ export class UsageService implements UsageApi {
 		}
 		return this.#fetchUsageCached(usageRequest(provider, usageCredential, options?.baseUrl), {
 			timeoutMs: options?.timeoutMs ?? this.requestTimeoutMs,
+			maxAgeMs: options?.maxAgeMs,
 		});
 	}
 

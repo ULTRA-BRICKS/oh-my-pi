@@ -976,6 +976,18 @@ describe("AuthStorage codex oauth ranking", () => {
 			access: `refreshed-${credential.accountId}`,
 			expires: Date.now() + HOUR_MS,
 		}));
+		// A real usage fetch stamps its report at fetch time; re-stamp the fixtures so
+		// the advanced clock does not make them look like stale snapshots.
+		for (const accountId of ["acct-protected", "acct-measured"]) {
+			usageByAccount.set(
+				accountId,
+				createCodexUsageReport({
+					accountId,
+					primary: { usedFraction: accountId === "acct-protected" ? 0.95 : 0.2, resetInMs: HOUR_MS },
+					secondary: { usedFraction: accountId === "acct-protected" ? 0.95 : 0.2, resetInMs: WEEK_MS },
+				}),
+			);
+		}
 		await authStorage.usage.invalidate("openai-codex");
 		expect(await authStorage.keys.get("openai-codex", "preflight-reserve-pin")).toBe("api-acct-measured");
 	});
@@ -4234,6 +4246,9 @@ describe("AuthStorage claude oauth ranking", () => {
 		// After >1h of Anthropic request inactivity the prompt cache is no longer
 		// guaranteed warm, so ranking must run again and rotate to the better sibling.
 		clockOffset = 30 * 60 * 1000 + 2 * HOUR_MS;
+		// A real usage fetch stamps its report at fetch time; re-stamp the fixture so
+		// the advanced clock does not make it look like a stale snapshot.
+		setUsage(0.9, 0.2);
 		expect(await storage.keys.get("anthropic", "claude-idle-gating")).toBe("api-acct-fresh");
 	});
 

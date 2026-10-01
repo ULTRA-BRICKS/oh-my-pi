@@ -27,10 +27,17 @@ import type { UsageService } from "./usage";
 import {
 	isUsageLimitExhausted,
 	isUsageLimitReached,
-	scopedUsageLimits,
+	liveScopedUsageLimits,
 	usageResetAtMs,
 	windowResetAt,
 } from "./usage-report";
+
+/**
+ * A sibling's usage must be this fresh before a rotation decision may call it
+ * available. Rotation is rare, so spending one extra usage probe per stale
+ * sibling is cheap next to switching onto an account that is already spent.
+ */
+const ROTATION_SIBLING_USAGE_MAX_AGE_MS = 60_000;
 
 /** Routing scope and strategy for one failed credential. */
 export type CredentialBlockRouting = {
@@ -206,6 +213,67 @@ export class RateLimits implements LimitsApi {
 	}
 
 	/**
+	 * A sibling with no block record is "available" only until its usage says
+	 * otherwise: blocks are recorded lazily, so an exhausted account that was
+	 * never ranked looks free. Probe unblocked siblings one at a time
+	 * (re-fetching stale snapshots) until one is confirmed to have headroom,
+	 * blocking the exhausted ones on the way, so rotation never reports a
+	 * switch onto an account that has nothing left. An unreadable sibling stays
+	 * available: no data is not evidence of exhaustion. Broker-backed stores
+	 * own report freshness and ignore the age bound.
+	 */
+	async #blockExhaustedSiblings(
+		provider: string,
+		credentialType: AuthCredential["type"],
+		targetCredentialId: number,
+		routing: CredentialBlockRouting,
+		options: MarkUsageLimitOptions | undefined,
+	): Promise<void> {
+		const strategy = routing.strategy;
+		const siblings = this.#deps.pool
+			.entries(provider)
+			.map((entry, index) => ({ entry, index }))
+			.filter(
+				({ entry, index }) =>
+					entry.id !== targetCredentialId &&
+					entry.credential.type === credentialType &&
+					this.#deps.blocks.blockedUntil(provider, routing.providerKey, index, routing.siblingBlockScopes) ===
+						undefined,
+			);
+		// Sequential on purpose: usage endpoints rate-limit per source IP, so a
+		// parallel fan-out on the 429 recovery path would fail its own probes.
+		// One sibling confirmed to have headroom is all a switch needs.
+		for (const { entry } of siblings) {
+			const report = await raceSignal(
+				this.#deps.usage.report(provider, entry.credential, {
+					...options,
+					maxAgeMs: ROTATION_SIBLING_USAGE_MAX_AGE_MS,
+				}),
+				options?.signal,
+				"usage fetch aborted",
+			);
+			if (!report) continue;
+			const limits = liveScopedUsageLimits(strategy, report, routing.rankingContext, Date.now());
+			if (!isUsageLimitReached(limits)) {
+				if (limits.length > 0) return;
+				continue;
+			}
+			// The fetch may have refreshed or removed rows; re-resolve by durable id.
+			const index = this.#deps.pool.entries(provider).findIndex(row => row.id === entry.id);
+			if (index < 0) continue;
+			const resetAtMs = usageResetAtMs(limits, Date.now());
+			this.#deps.blocks.mark(
+				provider,
+				routing.providerKey,
+				index,
+				resetAtMs ?? Date.now() + DEFAULT_BLOCK_MS,
+				routing.blockScope,
+				resetAtMs !== undefined,
+			);
+		}
+	}
+
+	/**
 	 * Marks the current session's credential as temporarily blocked due to usage limits.
 	 * Uses usage reports to determine accurate reset time when available.
 	 * Returns whether a sibling credential is available now; when none is, also
@@ -251,7 +319,7 @@ export class RateLimits implements LimitsApi {
 				"usage fetch aborted",
 			);
 			if (report) {
-				const scopedLimits = scopedUsageLimits(routing.strategy, report, routing.rankingContext);
+				const scopedLimits = liveScopedUsageLimits(routing.strategy, report, routing.rankingContext, Date.now());
 				if (isUsageLimitReached(scopedLimits)) {
 					const resetAtMs = usageResetAtMs(scopedLimits, Date.now());
 					if (resetAtMs && resetAtMs > blockedUntil) {
@@ -270,6 +338,7 @@ export class RateLimits implements LimitsApi {
 			}
 		}
 		options?.signal?.throwIfAborted();
+		await this.#blockExhaustedSiblings(provider, credentialType, targetCredentialId, routing, options);
 
 		// Usage lookup may refresh, disable, or remove a row. Re-resolve its
 		// durable id before applying positional in-memory and persisted blocks.

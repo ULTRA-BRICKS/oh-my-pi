@@ -26,9 +26,11 @@ import type { ApiKeyCredential, AuthApiKeyOptions, AuthCredential, OAuthCredenti
 import type { UsageService } from "./usage";
 import {
 	isUsageLimitReached,
+	liveScopedUsageLimits,
 	normalizeUsageFraction,
 	remainingUsageFraction,
 	scopedUsageLimits,
+	usageForRanking,
 	usageResetAtMs,
 	windowRequiredDrain,
 } from "./usage-report";
@@ -234,7 +236,9 @@ export class CredentialSelector {
 			const { selection, usage, usageChecked } = result;
 			let { blockedUntil } = result;
 			let blocked = blockedUntil !== undefined;
-			const scopedLimits = usage ? scopedUsageLimits(strategy, usage, args.rankingContext) : undefined;
+			// Rank on the live view: a stale snapshot must not vouch for headroom nor keep a reset window exhausted.
+			const liveUsage = usageForRanking(usage, nowMs);
+			const scopedLimits = liveUsage ? scopedUsageLimits(strategy, liveUsage, args.rankingContext) : undefined;
 			if (!blocked && scopedLimits && isUsageLimitReached(scopedLimits)) {
 				const resetAtMs = usageResetAtMs(scopedLimits, nowMs);
 				blockedUntil = resetAtMs ?? Date.now() + DEFAULT_BLOCK_MS;
@@ -248,7 +252,7 @@ export class CredentialSelector {
 				);
 				blocked = true;
 			}
-			const windows = usage ? strategy.findWindowLimits(usage, args.rankingContext) : undefined;
+			const windows = liveUsage ? strategy.findWindowLimits(liveUsage, args.rankingContext) : undefined;
 			const primary = windows?.primary;
 			const secondary = windows?.secondary;
 			const usageMeasured = primary !== undefined || secondary !== undefined;
@@ -426,7 +430,10 @@ export class CredentialSelector {
 			const { selection, usage, usageChecked } = result;
 			let { blockedUntil } = result;
 			let blocked = blockedUntil !== undefined;
-			const scopedLimits = usage && strategy ? scopedUsageLimits(strategy, usage, args.rankingContext) : undefined;
+			// Rank on the live view: a stale snapshot must not vouch for headroom nor keep a reset window exhausted.
+			const liveUsage = usageForRanking(usage, nowMs);
+			const scopedLimits =
+				liveUsage && strategy ? scopedUsageLimits(strategy, liveUsage, args.rankingContext) : undefined;
 			if (!blocked && scopedLimits && isUsageLimitReached(scopedLimits)) {
 				const resetAtMs = usageResetAtMs(scopedLimits, nowMs);
 				blockedUntil = resetAtMs ?? Date.now() + DEFAULT_BLOCK_MS;
@@ -440,10 +447,10 @@ export class CredentialSelector {
 				);
 				blocked = true;
 			}
-			const windows = usage && strategy ? strategy.findWindowLimits(usage, args.rankingContext) : undefined;
+			const windows = liveUsage && strategy ? strategy.findWindowLimits(liveUsage, args.rankingContext) : undefined;
 			const primary = windows?.primary;
 			const secondary = windows?.secondary;
-			const remainingFraction = remainingUsageFraction(strategy, usage, args.rankingContext, nowMs);
+			const remainingFraction = remainingUsageFraction(strategy, liveUsage, args.rankingContext, nowMs);
 			const usageMeasured =
 				strategy === undefined ? remainingFraction !== undefined : primary !== undefined || secondary !== undefined;
 			const primaryUncapped = primary === undefined && secondary !== undefined;
@@ -1076,7 +1083,7 @@ export class CredentialSelector {
 				return undefined;
 			}
 			if (checkUsage && !allowBlocked && usage && strategy && rankingContext) {
-				const scopedLimits = scopedUsageLimits(strategy, usage, rankingContext);
+				const scopedLimits = liveScopedUsageLimits(strategy, usage, rankingContext, Date.now());
 				if (isUsageLimitReached(scopedLimits)) {
 					const resetAtMs = usageResetAtMs(scopedLimits, Date.now());
 					this.#deps.blocks.mark(
@@ -1145,7 +1152,7 @@ export class CredentialSelector {
 					return undefined;
 				}
 				if (checkUsage && !allowBlocked && usage && strategy && rankingContext) {
-					const scopedLimits = scopedUsageLimits(strategy, usage, rankingContext);
+					const scopedLimits = liveScopedUsageLimits(strategy, usage, rankingContext, Date.now());
 					if (isUsageLimitReached(scopedLimits)) {
 						const resetAtMs = usageResetAtMs(scopedLimits, Date.now());
 						this.#deps.blocks.mark(
