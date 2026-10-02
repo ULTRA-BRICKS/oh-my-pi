@@ -10,15 +10,16 @@ import {
 } from "../eval/py/executor";
 import { defaultEvalSessionId } from "../eval/session-id";
 import type { ExtensionRunner } from "../extensibility/extensions";
+import { normalizeHookIdentity } from "../hook-identity-env";
 import { outputMeta } from "../tools/output-meta";
 import type { PythonExecutionMessage } from "./messages";
 import type { SessionManager } from "./session-manager";
-
 /** Capabilities the eval runner borrows from its owning session. */
 export interface EvalRunnerHost {
 	agent: Agent;
 	sessionManager: SessionManager;
 	settings: Settings;
+	getAgentId(): string | null;
 	extensionRunner(): ExtensionRunner | undefined;
 	isStreaming(): boolean;
 	appendSessionMessage(message: PythonExecutionMessage): void;
@@ -65,6 +66,9 @@ export class EvalRunner {
 					return hookResult.result;
 				}
 			}
+			const sessionFile = this.#host.sessionManager.getSessionFile() ?? undefined;
+			const agentId = this.#host.getAgentId() ?? undefined;
+			const identity = normalizeHookIdentity({ sessionFile, agentId });
 			const sessionId =
 				this.getSessionId() ??
 				defaultEvalSessionId({
@@ -73,6 +77,8 @@ export class EvalRunner {
 				});
 			const result = await executePythonCommand(code, {
 				cwd,
+				sessionFile: identity.sessionFile,
+				agentId: identity.agentId,
 				sessionId: namespacePythonSessionId(sessionId),
 				kernelOwnerId: this.#kernelOwnerId,
 				kernelMode: this.#host.settings.get("python.kernelMode"),

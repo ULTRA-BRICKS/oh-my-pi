@@ -2,6 +2,7 @@
  * Shared command execution utilities for hooks and custom tools.
  */
 import { ptree } from "@oh-my-pi/pi-utils";
+import { getHookInvocationEnv } from "../hook-identity-env";
 
 /**
  * Options for executing shell commands.
@@ -37,6 +38,7 @@ export async function execCommand(
 ): Promise<ExecResult> {
 	const result = await ptree.exec([command, ...args], {
 		cwd,
+		env: getHookInvocationEnv(),
 		signal: options?.signal,
 		timeout: options?.timeout,
 		allowNonZero: true,

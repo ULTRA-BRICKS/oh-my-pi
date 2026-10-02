@@ -11,16 +11,17 @@ import type { ImageContent } from "@oh-my-pi/pi-ai";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { ImageProtocol, TERMINAL } from "@oh-my-pi/pi-tui";
 import { getProjectDir, isEnoent, logger, prompt } from "@oh-my-pi/pi-utils";
-import { isPosixShell } from "@oh-my-pi/pi-utils/procmgr";
+import { isCmdShell, isPosixShell } from "@oh-my-pi/pi-utils/procmgr";
+import { $ } from "bun";
 import {
 	DEFAULT_AUTO_BACKGROUND_THRESHOLD_MS,
 	formatBackgroundNotice,
 	raceJobSettlement,
 	resolveAutoBackgroundWaitMs,
 } from "../async";
-import type { Settings } from "../config/settings";
+import { Settings } from "../config/settings";
 import { applyDirenvPreflight, type BashResult, executeBash } from "../exec/bash-executor";
-import { mergeHookIdentityEnv } from "../hook-identity-env";
+import { HOOK_IDENTITY_ENV_KEYS, mergeHookIdentityEnv } from "../hook-identity-env";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { InternalUrlRouter } from "../internal-urls";
 import { truncateToVisualLines } from "../modes/components/visual-truncate";
@@ -155,7 +156,9 @@ export function wrapShellLineForClientTerminal(
 	shellConfig: { shell: string; args: string[]; prefix?: string | undefined },
 ): { command: string; args: string[] } {
 	const finalLine = shellConfig.prefix ? `${shellConfig.prefix} ${line}` : line;
-	return { command: shellConfig.shell, args: [...shellConfig.args, finalLine] };
+	// cmd AutoRun must not replace the invocation environment before /c runs.
+	const args = isCmdShell(shellConfig.shell) ? ["/d", ...shellConfig.args] : shellConfig.args;
+	return { command: shellConfig.shell, args: [...args, finalLine] };
 }
 
 /**
@@ -896,6 +899,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 
 	#startManagedBashJob(options: {
 		command: string;
+		commandPrologue: string;
 		commandCwd: string;
 		timeoutMs: number | undefined;
 		timeoutSec: number | undefined;
@@ -926,6 +930,8 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 				const wallTimeStart = performance.now();
 				try {
 					const result = await executeBash(options.command, {
+						commandPrologue: options.commandPrologue,
+						direnvExcludedEnvKeys: HOOK_IDENTITY_ENV_KEYS,
 						cwd: options.commandCwd,
 						sessionKey: `${this.session.getSessionId?.() ?? ""}:async:${jobId}`,
 						timeout: options.timeoutMs ?? 0,
@@ -1083,10 +1089,41 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 					),
 				)
 			: undefined;
-		const resolvedEnvWithIdentity = mergeHookIdentityEnv(resolvedEnv, {
+		let resolvedEnvWithIdentity = mergeHookIdentityEnv(resolvedEnv, {
 			sessionFile: this.session.getSessionFile?.() ?? null,
 			agentId: this.session.getAgentId?.() ?? null,
 		});
+
+		// Explicit async jobs use the embedded shell; otherwise ACP wins over auto-backgrounding.
+		const clientBridge = asyncRequested ? undefined : this.session.getClientBridge?.();
+		const bridgeTerminalAvailable = Boolean(
+			clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty,
+		);
+		const interactiveShellConfig =
+			!asyncRequested && canUseInteractiveBashPty(pty, ctx) ? (await Settings.init()).getShellConfig() : undefined;
+		// Direct and managed jobs execute POSIX text in the embedded shell.
+		const commandShell = bridgeTerminalAvailable
+			? this.session.settings.getShellConfig().shell
+			: interactiveShellConfig?.shell;
+		let commandPrologue = "";
+		if (commandShell !== undefined && !isPosixShell(commandShell)) {
+			// ACP and PTY env overlays cannot delete inherited entries. Empty values
+			// suppress absent markers without injecting syntax into an unknown shell.
+			// Non-POSIX startup files can still overwrite these environment values.
+			resolvedEnvWithIdentity = { ...resolvedEnvWithIdentity };
+			for (const key of HOOK_IDENTITY_ENV_KEYS) resolvedEnvWithIdentity[key] ??= "";
+		} else {
+			// Restore trusted identity after shell startup/snapshots, including values
+			// that startup files overwrote. Escape values before inserting shell syntax.
+			const absentIdentityKeys = HOOK_IDENTITY_ENV_KEYS.filter(key => resolvedEnvWithIdentity?.[key] === undefined);
+			const identityAssignments = HOOK_IDENTITY_ENV_KEYS.flatMap(key => {
+				const value = resolvedEnvWithIdentity?.[key];
+				return value === undefined ? [] : [`${key}=${$.escape(value)}`];
+			});
+			const clearIdentity = absentIdentityKeys.length > 0 ? `unset -v ${absentIdentityKeys.join(" ")}; ` : "";
+			const exportIdentity = identityAssignments.length > 0 ? `export ${identityAssignments.join(" ")}; ` : "";
+			commandPrologue = `${clearIdentity}${exportIdentity}`;
+		}
 
 		// Resolve protocol URLs (skill://, agent://, etc.) in extracted cwd.
 		if (cwd?.includes("://") || cwd?.includes("local:/")) {
@@ -1132,13 +1169,14 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			}
 			const job = this.#startManagedBashJob({
 				command,
+				commandPrologue,
 				commandCwd,
 				timeoutMs,
 				timeoutSec,
 				requestedTimeoutSec,
 				notices: pendingNotices,
 
-				resolvedEnvWithIdentity,
+				resolvedEnv: resolvedEnvWithIdentity,
 				onUpdate,
 				forwardUpdates: false,
 			});
@@ -1147,14 +1185,6 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 				notices: pendingNotices,
 			});
 		}
-
-		// The client-bridge terminal provides a live terminal card in the editor;
-		// when available it wins over auto-backgrounding (both are opt-in, and
-		// auto-background would otherwise silently disable the terminal route).
-		const clientBridge = this.session.getClientBridge?.();
-		const bridgeTerminalAvailable = Boolean(
-			clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty,
-		);
 
 		const autoBgManager = this.session.asyncJobManager;
 		// At the running-job cap, fall through to direct foreground execution
@@ -1170,13 +1200,14 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			const startBackgrounded = autoBackgroundWaitMs === 0;
 			const job = this.#startManagedBashJob({
 				command,
+				commandPrologue,
 				commandCwd,
 				timeoutMs,
 				timeoutSec,
 				requestedTimeoutSec,
 				notices: pendingNotices,
 
-				resolvedEnvWithIdentity,
+				resolvedEnv: resolvedEnvWithIdentity,
 				onUpdate,
 				forwardUpdates: !startBackgrounded,
 			});
@@ -1224,9 +1255,8 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		// that bypass `executeBash` — the ACP client terminal and the PTY. The
 		// `executeBash` branch below is intentionally excluded: it runs its own
 		// preflight internally, so routing the pre-applied command there too
-		// would double-apply the unset prefix and re-merge the env. No
-		// `commandPrefix` here: ACP applies the shell prefix via
-		// `wrapShellLineForClientTerminal`, and the PTY path never wrapped one.
+		// would double-apply setup and re-merge the env. Keep the configured
+		// prefix attached to the user command, outside direnv and identity setup.
 		// `callerTimeoutMs` clamps the direnv load to a positive command timeout
 		// (the backend's own timeout is installed only after this await), matching
 		// the executeBash branch so a cold `.envrc` can't outlast a short call.
@@ -1234,6 +1264,12 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			(clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty) ||
 			canUseInteractiveBashPty(pty, ctx)
 				? await applyDirenvPreflight(command, commandCwd, {
+						direnvExcludedEnvKeys: HOOK_IDENTITY_ENV_KEYS,
+						commandPrologue,
+						commandPrefix: bridgeTerminalAvailable
+							? this.session.settings.getShellConfig().prefix
+							: interactiveShellConfig?.prefix,
+						posixShell: commandShell === undefined || isPosixShell(commandShell),
 						callerEnv: resolvedEnvWithIdentity,
 						signal,
 						timeoutMs: this.session.settings.get("bash.direnvLoadTimeoutMs"),
@@ -1308,7 +1344,10 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 				// env; falls back to the raw command/env when direnv is off/absent.
 				const bridgeCommand = backendPreflight?.command ?? command;
 				const bridgeEnv = backendPreflight?.env ?? resolvedEnvWithIdentity;
-				const shellSpawn = wrapShellLineForClientTerminal(bridgeCommand, this.session.settings.getShellConfig());
+				const shellSpawn = wrapShellLineForClientTerminal(bridgeCommand, {
+					...this.session.settings.getShellConfig(),
+					prefix: undefined,
+				});
 				const createP = clientBridge.createTerminal({
 					command: shellSpawn.command,
 					args: shellSpawn.args,
@@ -1522,6 +1561,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 					// command + merged env (backendPreflight is defined whenever this
 					// branch runs, since both gate on canUseInteractiveBashPty).
 					command: backendPreflight?.command ?? command,
+					shell: interactiveShellConfig?.shell,
 					cwd: commandCwd,
 					timeoutMs,
 					signal,
@@ -1533,6 +1573,8 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 				// command + resolvedEnvWithIdentity here so the unset prefix / env merge is not
 				// applied twice.
 				await executeBash(command, {
+					commandPrologue,
+					direnvExcludedEnvKeys: HOOK_IDENTITY_ENV_KEYS,
 					cwd: commandCwd,
 					sessionKey: this.session.getSessionId?.() ?? undefined,
 					timeout: timeoutMs ?? 0,

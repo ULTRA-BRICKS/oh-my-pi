@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import * as os from "node:os";
+import * as direnvModule from "../src/exec/direnv";
 import type { ClientBridge, ClientBridgeTerminalHandle } from "@oh-my-pi/pi-coding-agent/session/client-bridge";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { encodeTerminalImage } from "@oh-my-pi/pi-coding-agent/utils/terminal-graphics";
+import { TempDir, ptree } from "@oh-my-pi/pi-utils";
 
 function makeSession(bridge: ClientBridge): ToolSession {
 	return {
@@ -61,6 +63,146 @@ afterEach(() => {
 });
 
 describe("BashTool ACP terminal routing", () => {
+	it("restores explicit identity after shell startup without evaluating identity values", async () => {
+		using temp = TempDir.createSync("@omp-acp-startup-identity-");
+		const startup = temp.join(".bash_profile");
+		await Bun.write(
+			startup,
+			"export PI_SESSION_FILE=/tmp/startup-stale.jsonl RIG_AGENT_ID=StartupStale\nexport STARTUP_RAN=yes\n",
+		);
+		const identity = {
+			sessionFile: "/tmp/child's $(printf injected); session.jsonl",
+			agentId: "Child'$(printf injected);Agent",
+		};
+		const bridge: ClientBridge = {
+			capabilities: { terminal: true },
+			createTerminal: async request => {
+				const result = await ptree.exec([request.command, ...(request.args ?? [])], {
+					cwd: request.cwd,
+					env: {
+						...process.env,
+						...Object.fromEntries((request.env ?? []).map(({ name, value }) => [name, value])),
+					},
+					timeout: 2000,
+					allowNonZero: true,
+				});
+				return {
+					terminalId: "startup-identity",
+					waitForExit: async () => ({ exitCode: result.exitCode ?? 0, signal: null }),
+					currentOutput: async () => ({ output: result.stdout, truncated: false }),
+					kill: async () => {},
+					release: async () => {},
+				};
+			},
+		};
+		const session = makeSession(bridge);
+		session.getSessionFile = () => identity.sessionFile;
+		session.getAgentId = () => identity.agentId;
+		const result = await new BashTool(session).execute("startup", {
+			command: 'printf "%s|%s|%s" "$STARTUP_RAN" "$PI_SESSION_FILE" "$RIG_AGENT_ID" | cat; exit 7',
+			env: { HOME: temp.path(), PI_SESSION_FILE: "caller-stale", RIG_AGENT_ID: "caller-stale" },
+		});
+		expect(result.content.find(block => block.type === "text")?.text).toContain(
+			`yes|${identity.sessionFile}|${identity.agentId}`,
+		);
+		expect(result.details?.exitCode).toBe(7);
+	});
+
+	it("preserves cmd.exe command syntax and overrides inherited identity through terminal env", async () => {
+		const bridge: ClientBridge = {
+			capabilities: { terminal: true },
+			createTerminal: async () => ({
+				terminalId: "cmd-identity",
+				waitForExit: async () => ({ exitCode: 0, signal: null }),
+				currentOutput: async () => ({ output: "", truncated: false }),
+				kill: async () => {},
+				release: async () => {},
+			}),
+		};
+		const createSpy = spyOn(bridge, "createTerminal");
+		const session = makeSession(bridge);
+		spyOn(session.settings, "getShellConfig").mockReturnValue({
+			shell: "C:\\Windows\\System32\\cmd.exe",
+			args: ["/c"],
+			env: {},
+			prefix: undefined,
+		});
+		const command = 'echo %PI_SESSION_FILE% & echo %RIG_AGENT_ID% | findstr /v "skip"';
+		for (const agentId of ["Main", null, "Child%PATH%!name&"] as const) {
+			session.getAgentId = () => agentId;
+			session.getSessionFile = () => (agentId === null ? null : "C:\\sessions\\child.jsonl");
+			await new BashTool(session).execute("cmd", {
+				command,
+				env: { PI_SESSION_FILE: "caller-stale", RIG_AGENT_ID: "caller-stale", CUSTOM: "keep" },
+			});
+			const request = createSpy.mock.calls.at(-1)![0];
+			expect(request.command).toBe("C:\\Windows\\System32\\cmd.exe");
+			expect(request.args).toEqual(["/d", "/c", command]);
+			expect(request.env).toContainEqual({
+				name: "PI_SESSION_FILE",
+				value: agentId?.startsWith("Child") ? "C:\\sessions\\child.jsonl" : "",
+			});
+			expect(request.env).toContainEqual({
+				name: "RIG_AGENT_ID",
+				value: agentId?.startsWith("Child") ? agentId : "",
+			});
+			expect(request.env).toContainEqual({ name: "CUSTOM", value: "keep" });
+		}
+	});
+
+	it.each([
+		{ shell: "cmd.exe", args: ["/d", "/c"], command: "echo %RIG_AGENT_ID%" },
+		{ shell: "pwsh.exe", args: ["-Command"], command: "Write-Output $env:RIG_AGENT_ID" },
+		{ shell: "/usr/bin/fish", args: ["-c"], command: "set -q RIG_AGENT_ID; and echo $RIG_AGENT_ID" },
+		{ shell: "/opt/custom-shell", args: ["--eval"], command: "custom identity --print" },
+	])("preserves non-POSIX shell text and identity env for $shell", async ({ shell, args, command }) => {
+		const bridge: ClientBridge = {
+			capabilities: { terminal: true },
+			createTerminal: async () => ({
+				terminalId: "cmd-identity",
+				waitForExit: async () => ({ exitCode: 0, signal: null }),
+				currentOutput: async () => ({ output: "", truncated: false }),
+				kill: async () => {},
+				release: async () => {},
+			}),
+		};
+		spyOn(direnvModule, "loadDirenvEnv").mockResolvedValue({
+			set: { CUSTOM: "direnv", DIRENV_SET: "loaded" },
+			unset: ["AWS_PROFILE", "CUSTOM", "BAD;NAME"],
+		});
+		const createSpy = spyOn(bridge, "createTerminal");
+		const session = makeSession(bridge);
+		spyOn(session.settings, "getShellConfig").mockReturnValue({
+			shell,
+			args: [...args],
+			env: {},
+			prefix: undefined,
+		});
+		for (const agentId of ["Main", null, "Child%PATH%!name&"] as const) {
+			session.getAgentId = () => agentId;
+			session.getSessionFile = () => (agentId === null ? null : "C:\\sessions\\child.jsonl");
+			await new BashTool(session).execute("cmd", {
+				command,
+				env: { PI_SESSION_FILE: "caller-stale", RIG_AGENT_ID: "caller-stale", CUSTOM: "keep" },
+			});
+			const request = createSpy.mock.calls.at(-1)![0];
+			expect(request.command).toBe(shell);
+			expect(request.args).toEqual(shell === "cmd.exe" ? ["/d", ...args, command] : [...args, command]);
+			expect(request.env).toContainEqual({
+				name: "PI_SESSION_FILE",
+				value: agentId?.startsWith("Child") ? "C:\\sessions\\child.jsonl" : "",
+			});
+			expect(request.env).toContainEqual({
+				name: "RIG_AGENT_ID",
+				value: agentId?.startsWith("Child") ? agentId : "",
+			});
+			expect(request.env).toContainEqual({ name: "CUSTOM", value: "keep" });
+			expect(request.env).toContainEqual({ name: "AWS_PROFILE", value: "" });
+			expect(request.env).toContainEqual({ name: "DIRENV_SET", value: "loaded" });
+			expect(request.env?.some(entry => entry.name === "BAD;NAME")).toBe(false);
+		}
+	});
+
 	it("emits a live terminal update but releases it before the completed result", async () => {
 		const stubText = "hello from terminal\n";
 
@@ -94,7 +236,7 @@ describe("BashTool ACP terminal routing", () => {
 		expect(createSpy).toHaveBeenCalledTimes(1);
 		const params = createSpy.mock.calls[0]![0];
 		expect(params.command).toBe("/bin/bash");
-		expect(params.args).toEqual(["-l", "-c", "echo hi"]);
+		expect(params.args).toEqual(["-l", "-c", "unset -v PI_SESSION_FILE RIG_AGENT_ID; echo hi"]);
 
 		// The first onUpdate must carry the terminalId so the editor can embed it
 		expect(updates.length).toBeGreaterThanOrEqual(1);
@@ -162,7 +304,7 @@ describe("BashTool ACP terminal routing", () => {
 		expect(createSpy).toHaveBeenCalledTimes(1);
 		const params = createSpy.mock.calls[0]![0];
 		expect(params.command).toBe("/bin/bash");
-		expect(params.args).toEqual(["-l", "-c", line]);
+		expect(params.args).toEqual(["-l", "-c", `unset -v PI_SESSION_FILE RIG_AGENT_ID; ${line}`]);
 		// `args` must actually be present — the bug was omitting it entirely.
 		expect(params.args).toBeDefined();
 		expect(params.args?.length).toBeGreaterThan(0);

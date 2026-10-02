@@ -61,7 +61,7 @@ interface KernelSessionRegistryDescriptor<
 > {
 	languageLabel: string;
 	cancelledErrorClass: CancelledErrorClass;
-	buildSessionKey: (sessionId: string, cwd: string, interpreter: string | undefined) => string;
+	buildSessionKey: (sessionId: string, cwd: string, options: TOptions) => string;
 	createSession: (session: KernelSession<TKernel>) => TSession;
 	startKernel: (cwd: string, options: TOptions) => Promise<TKernel>;
 	executeWithKernel: (kernel: TKernel, code: string, options: TOptions) => Promise<R>;
@@ -407,7 +407,7 @@ export function createKernelSessionRegistry<
 	function peekLiveKernel(cwd: string, options: TOptions): TKernel | undefined {
 		const sessionId = options.sessionId ?? `session:${cwd}`;
 		const sessionKey = resolveOwnerScopedSessionKey({
-			baseKey: descriptor.buildSessionKey(sessionId, cwd, options.interpreter),
+			baseKey: descriptor.buildSessionKey(sessionId, cwd, options),
 			ownerId: options.kernelOwnerId,
 			reset: false,
 			hasSession: key => sessions.has(key) || startingSessions.has(key),
@@ -420,7 +420,7 @@ export function createKernelSessionRegistry<
 	async function executeOnSession(code: string, cwd: string, options: TOptions): Promise<R> {
 		const sessionId = options.sessionId ?? `session:${cwd}`;
 		const sessionKey = resolveOwnerScopedSessionKey({
-			baseKey: descriptor.buildSessionKey(sessionId, cwd, options.interpreter),
+			baseKey: descriptor.buildSessionKey(sessionId, cwd, options),
 			ownerId: options.kernelOwnerId,
 			reset: options.reset === true,
 			hasSession: key => sessions.has(key) || startingSessions.has(key),

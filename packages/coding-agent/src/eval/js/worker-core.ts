@@ -1,3 +1,15 @@
+import {
+	clearHookIdentityWorkerCarriers,
+	DETACHED_AGENT_ENV_KEY,
+	DETACHED_PARENT_IDENTITY_ENV_KEYS,
+	detachedParentHookIdentity,
+	HOOK_IDENTITY_ENV_KEYS,
+	hasHookIdentity,
+	resolveHookIdentity,
+	sameHookIdentity,
+	syncHookIdentityEnv,
+	type HookIdentity,
+} from "../../hook-identity-env";
 import { ToolError } from "../../tools/tool-errors";
 import { JsRuntime, type RuntimeHooks } from "./shared/runtime";
 import type {
@@ -67,6 +79,9 @@ export type WorkerCoreOptions =
 /** Finished-cell filenames retained for attributing rejections that surface after the run settled. */
 const RECENT_CELL_FILES_MAX = 256;
 
+export const INLINE_IDENTITY_FALLBACK_ERROR =
+	"Cannot use inline JS eval worker for an identity-bearing session; worker isolation failed";
+
 function errorPayload(error: unknown): RunErrorPayload {
 	if (error instanceof Error) {
 		return {
@@ -111,6 +126,14 @@ function foldFloatingRejections(active: ActiveRun, result: RunResult, hooks: Run
 	}
 	return folded;
 }
+let inlineIdentityDepth = 0;
+const inlineIdentityEnvKeys = [
+	...HOOK_IDENTITY_ENV_KEYS,
+	DETACHED_AGENT_ENV_KEY,
+	DETACHED_PARENT_IDENTITY_ENV_KEYS.sessionFile,
+	DETACHED_PARENT_IDENTITY_ENV_KEYS.agentId,
+] as const;
+const inlineIdentityEnv = new Map<string, string | undefined>();
 
 export class WorkerCore {
 	#transport: Transport;
@@ -120,10 +143,14 @@ export class WorkerCore {
 	#unsubscribe: () => void;
 	#uninstallRejectionGuard: () => void;
 	#options: WorkerCoreOptions;
+	#inheritedIdentity: HookIdentity;
+	#effectiveIdentity: HookIdentity = {};
 
 	constructor(transport: Transport, options: WorkerCoreOptions) {
 		this.#transport = transport;
 		this.#options = options;
+		this.#inheritedIdentity = detachedParentHookIdentity(process.env);
+		if (options.mode === "isolated") clearHookIdentityWorkerCarriers(process.env);
 		this.#unsubscribe = transport.onMessage(msg => this.#handle(msg));
 		this.#uninstallRejectionGuard = this.#installRejectionGuard();
 	}
@@ -249,10 +276,25 @@ export class WorkerCore {
 	}
 
 	#ensureRuntime(snapshot: SessionSnapshot, currentRunId?: string): JsRuntime {
+		const identity = resolveHookIdentity(snapshot, this.#inheritedIdentity);
+		// Both raw child spawns and helpers share realm-wide identity while cells await.
+		for (const runId of this.#runs.keys()) {
+			if (runId !== currentRunId && !sameHookIdentity(identity, this.#effectiveIdentity)) {
+				throw new ToolError("Cannot run JS eval with a different effective identity while another run is active");
+			}
+		}
+		if (this.#options.mode === "inline") {
+			if (hasHookIdentity(identity)) {
+				throw new ToolError(INLINE_IDENTITY_FALLBACK_ERROR);
+			}
+		} else {
+			syncHookIdentityEnv(process.env, identity);
+		}
+		this.#effectiveIdentity = identity;
 		this.#syncProcessCwd(snapshot.cwd, currentRunId);
 		if (this.#runtime) {
 			this.#runtime.setCwd(snapshot.cwd);
-			this.#runtime.syncHookIdentityEnv({ sessionFile: snapshot.sessionFile, agentId: snapshot.agentId });
+			this.#runtime.syncHookIdentityEnv(identity);
 			return this.#runtime;
 		}
 		this.#runtime = new JsRuntime({
@@ -260,7 +302,7 @@ export class WorkerCore {
 			sessionId: snapshot.sessionId,
 			localRoots: snapshot.localRoots,
 		});
-		this.#runtime.syncHookIdentityEnv({ sessionFile: snapshot.sessionFile, agentId: snapshot.agentId });
+		this.#runtime.syncHookIdentityEnv(identity);
 		return this.#runtime;
 	}
 
@@ -299,6 +341,32 @@ export class WorkerCore {
 		}
 	}
 
+	async #withInlineIdentity<T>(identity: HookIdentity, action: () => Promise<T>): Promise<T> {
+		const suppressInherited = this.#options.mode === "inline" && !hasHookIdentity(identity);
+		if (!suppressInherited) return await action();
+
+		if (inlineIdentityDepth === 0) {
+			for (const key of inlineIdentityEnvKeys) {
+				inlineIdentityEnv.set(key, process.env[key]);
+				delete process.env[key];
+			}
+		}
+		inlineIdentityDepth += 1;
+		try {
+			return await action();
+		} finally {
+			inlineIdentityDepth -= 1;
+			if (inlineIdentityDepth === 0) {
+				for (const key of inlineIdentityEnvKeys) {
+					const value = inlineIdentityEnv.get(key);
+					if (value === undefined) delete process.env[key];
+					else process.env[key] = value;
+				}
+				inlineIdentityEnv.clear();
+			}
+		}
+	}
+
 	async #runOne(runId: string, code: string, filename: string, snapshot: SessionSnapshot): Promise<void> {
 		const active: ActiveRun = { runId, filename, pendingTools: new Map(), floatingRejections: [] };
 		this.#runs.set(runId, active);
@@ -307,27 +375,27 @@ export class WorkerCore {
 			onDisplay: output => this.#transport.send({ type: "display", runId, output }),
 			callTool: (name, args) => this.#callTool(active, name, args),
 		};
-		let result: RunResult;
+		let result: RunResult | undefined;
 		try {
-			const runtime = this.#ensureRuntime(snapshot, runId);
-			runtime.setCwd(snapshot.cwd);
-			runtime.syncPreludes(snapshot.preludes ?? []);
-			const value = await runtime.run(code, filename, hooks, { runId, cwd: snapshot.cwd });
-			runtime.displayValue(value, hooks);
-			result = { type: "result", runId, ok: true };
-		} catch (error) {
-			result = { type: "result", runId, ok: false, error: errorPayload(error) };
-		}
-		try {
-			// One event-loop turn so rejections the cell already floated surface
-			// while this run can still own them (rejection callbacks run before
-			// timers fire).
-			await Bun.sleep(0);
-			result = foldFloatingRejections(active, result, hooks);
+			result = await this.#withInlineIdentity(resolveHookIdentity(snapshot, this.#inheritedIdentity), async () => {
+				let runResult: RunResult;
+				try {
+					const runtime = this.#ensureRuntime(snapshot, runId);
+					runtime.setCwd(snapshot.cwd);
+					runtime.syncPreludes(snapshot.preludes ?? []);
+					const value = await runtime.run(code, filename, hooks, { runId, cwd: snapshot.cwd });
+					runtime.displayValue(value, hooks);
+					runResult = { type: "result", runId, ok: true };
+				} catch (error) {
+					runResult = { type: "result", runId, ok: false, error: errorPayload(error) };
+				}
+				await Bun.sleep(0);
+				return foldFloatingRejections(active, runResult, hooks);
+			});
 		} finally {
 			this.#runs.delete(runId);
 			this.#rememberCellFile(filename);
-			this.#transport.send(result);
+			if (result) this.#transport.send(result);
 		}
 	}
 
@@ -345,47 +413,57 @@ export class WorkerCore {
 			callTool: (name, args) => this.#callTool(active, name, args),
 		};
 
+		let result: RunResult | undefined;
 		try {
-			const runtime = this.#runtime;
-			if (!runtime) throw new ToolError("JavaScript kernel is not running");
-			const rawRegistry = runtime.getGlobal("__omp_tools__");
-			const tools = new Map<string, KernelToolSpec>();
-			if (rawRegistry instanceof Map) {
-				for (const [name, value] of rawRegistry) {
-					if (typeof name === "string" && isKernelToolSpec(value)) tools.set(name, value);
-				}
-			}
-
-			let envelope: Record<string, unknown>;
-			if (msg.op === "describe") {
-				const names = msg.names.length > 0 ? msg.names : [...tools.keys()];
-				envelope = {
-					ok: true,
-					tools: names.flatMap(name => {
-						const spec = tools.get(name);
-						return spec ? [{ name: spec.name, description: spec.description, parameters: spec.parameters }] : [];
-					}),
-					missing: names.filter(name => !tools.has(name)),
-				};
-			} else {
-				const spec = tools.get(msg.name);
-				if (!spec) throw new ToolError(`tool ${JSON.stringify(msg.name)} is not defined`);
-				const value = await runtime.runCallback(msg.runId, hooks, () => spec.fn(msg.args ?? {}));
-				let cloneable: unknown;
+			result = await this.#withInlineIdentity(this.#effectiveIdentity, async () => {
+				let runResult: RunResult;
 				try {
-					cloneable = structuredClone(value);
-				} catch {
-					cloneable = String(value);
+					const runtime = this.#runtime;
+					if (!runtime) throw new ToolError("JavaScript kernel is not running");
+					const rawRegistry = runtime.getGlobal("__omp_tools__");
+					const tools = new Map<string, KernelToolSpec>();
+					if (rawRegistry instanceof Map) {
+						for (const [name, value] of rawRegistry) {
+							if (typeof name === "string" && isKernelToolSpec(value)) tools.set(name, value);
+						}
+					}
+
+					let envelope: Record<string, unknown>;
+					if (msg.op === "describe") {
+						const names = msg.names.length > 0 ? msg.names : [...tools.keys()];
+						envelope = {
+							ok: true,
+							tools: names.flatMap(name => {
+								const spec = tools.get(name);
+								return spec
+									? [{ name: spec.name, description: spec.description, parameters: spec.parameters }]
+									: [];
+							}),
+							missing: names.filter(name => !tools.has(name)),
+						};
+					} else {
+						const spec = tools.get(msg.name);
+						if (!spec) throw new ToolError(`tool ${JSON.stringify(msg.name)} is not defined`);
+						const value = await runtime.runCallback(msg.runId, hooks, () => spec.fn(msg.args ?? {}));
+						let cloneable: unknown;
+						try {
+							cloneable = structuredClone(value);
+						} catch {
+							cloneable = String(value);
+						}
+						envelope = { ok: true, value: cloneable };
+					}
+					this.#transport.send({ type: "display", runId: msg.runId, output: { type: "json", data: envelope } });
+					runResult = { type: "result", runId: msg.runId, ok: true };
+				} catch (error) {
+					runResult = { type: "result", runId: msg.runId, ok: false, error: errorPayload(error) };
 				}
-				envelope = { ok: true, value: cloneable };
-			}
-			this.#transport.send({ type: "display", runId: msg.runId, output: { type: "json", data: envelope } });
-			this.#transport.send({ type: "result", runId: msg.runId, ok: true });
-		} catch (error) {
-			this.#transport.send({ type: "result", runId: msg.runId, ok: false, error: errorPayload(error) });
+				return runResult;
+			});
 		} finally {
 			this.#runs.delete(msg.runId);
 			this.#rememberCellFile(active.filename);
+			if (result) this.#transport.send(result);
 		}
 	}
 

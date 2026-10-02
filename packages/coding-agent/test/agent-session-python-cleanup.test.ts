@@ -179,6 +179,41 @@ describe("AgentSession python cleanup", () => {
 		}
 	});
 
+	it("passes owning hook identity to legacy Python execution and clears reserved Main", async () => {
+		const { tempDir, cwd } = createTempProject();
+		tempDirs.push(tempDir);
+		const session = await createSession(tempDir, cwd);
+		const execute = vi.spyOn(pythonExecutor, "executePython").mockResolvedValue({
+			output: "",
+			exitCode: 0,
+			cancelled: false,
+			truncated: false,
+			displayOutputs: [],
+			totalLines: 0,
+			totalBytes: 0,
+			outputLines: 0,
+			outputBytes: 0,
+			stdinRequested: false,
+		});
+		vi.spyOn(session.sessionManager, "getSessionFile").mockReturnValue("/sessions/worker.jsonl");
+		const agentId = vi.spyOn(session, "getAgentId").mockReturnValue("Worker");
+		try {
+			await session.executePython("print('worker')");
+			expect(execute.mock.calls[0]?.[1]).toMatchObject({
+				sessionFile: "/sessions/worker.jsonl",
+				agentId: "Worker",
+			});
+			agentId.mockReturnValue("Main");
+			await session.executePython("print('main')");
+			expect(execute.mock.calls[1]?.[1]).toMatchObject({
+				agentId: undefined,
+				sessionFile: undefined,
+			});
+		} finally {
+			await session.dispose();
+		}
+	});
+
 	it("does not dispose unrelated Python owners when createAgentSession fails before session construction", async () => {
 		const { tempDir, cwd } = createTempProject();
 		tempDirs.push(tempDir);

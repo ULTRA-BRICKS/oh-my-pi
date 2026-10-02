@@ -13,6 +13,7 @@ import {
 } from "../backend-helpers";
 import type { BackendProbeOptions } from "../probe";
 import { defaultEvalSessionId } from "../session-id";
+import { normalizeHookIdentity, resolveHookIdentity } from "../../hook-identity-env";
 import { executePython, type PythonExecutorOptions } from "./executor";
 import { checkPythonKernelAvailability } from "./kernel";
 
@@ -33,13 +34,19 @@ export function resolvePythonKernelIdentity(session: ToolSession): {
 	interpreter: string | undefined;
 	kernelOwnerId: string | undefined;
 	agentId: string | undefined;
+	sessionFile: string | undefined;
 } {
+	const identity = normalizeHookIdentity({
+		agentId: session.getAgentId?.() ?? undefined,
+		sessionFile: session.getSessionFile?.() ?? undefined,
+	});
 	return {
 		cwd: session.cwd,
 		sessionId: namespaceSessionId(session.getEvalSessionId?.() ?? defaultEvalSessionId(session)),
 		interpreter: readInterpreterSetting(session),
 		kernelOwnerId: session.getEvalKernelOwnerId?.() ?? undefined,
-		agentId: session.getAgentId?.() ?? undefined,
+		agentId: identity.agentId,
+		sessionFile: identity.sessionFile,
 	};
 }
 
@@ -56,6 +63,7 @@ export default {
 	async execute(code: string, opts: ExecutorBackendExecOptions): Promise<ExecutorBackendResult> {
 		const kernelMode = readSetting<PythonExecutorOptions["kernelMode"]>(opts.session, "python.kernelMode");
 		const identity = resolvePythonKernelIdentity(opts.session);
+		const effectiveIdentity = resolveHookIdentity({ sessionFile: opts.sessionFile, agentId: opts.agentId }, identity);
 		const executorOptions: PythonExecutorOptions = {
 			cwd: identity.cwd,
 			idleTimeoutMs: opts.idleTimeoutMs,
@@ -63,11 +71,11 @@ export default {
 			sessionId: identity.sessionId,
 			kernelMode,
 			interpreter: identity.interpreter,
-			sessionFile: opts.sessionFile,
+			sessionFile: effectiveIdentity.sessionFile,
 			artifactsDir: opts.session.getArtifactsDir?.() ?? undefined,
 			localRoots: resolveEvalUrlRoots(opts.session),
 			kernelOwnerId: identity.kernelOwnerId,
-			agentId: opts.agentId ?? identity.agentId,
+			agentId: effectiveIdentity.agentId,
 			reset: opts.reset,
 			onChunk: opts.onChunk,
 			onStatus: opts.onStatus,

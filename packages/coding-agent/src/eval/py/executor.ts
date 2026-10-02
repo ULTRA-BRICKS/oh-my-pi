@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 
 import { getProjectDir, logger, Snowflake } from "@oh-my-pi/pi-utils";
+import { normalizeHookIdentity } from "../../hook-identity-env";
 import type { ToolSession } from "../../tools";
 import {
 	buildManagedKernelEnv,
@@ -47,6 +48,8 @@ export type PythonToolRequest =
 
 /** Session identity and bridge context for invoking a retained Python tool. */
 export interface PythonToolInvokeOptions {
+	agentId?: string;
+	sessionFile?: string;
 	cwd: string;
 	sessionId: string;
 	interpreter?: string;
@@ -405,9 +408,16 @@ async function executePerCall(code: string, cwd: string, options: PythonExecutor
 const sessionRegistry = createKernelSessionRegistry<PythonKernel, PythonExecutorOptions, PythonResult, PythonSession>({
 	languageLabel: "Python",
 	cancelledErrorClass: PythonExecutionCancelledError,
-	buildSessionKey: (sessionId, cwd, interpreter) => {
+	buildSessionKey: (sessionId, cwd, options) => {
 		const normalizedCwd = normalizeKernelSessionCwd(cwd);
-		return `${sessionId}\0${normalizedCwd}\0${normalizeExplicitInterpreter(normalizedCwd, interpreter)}`;
+		const identity = normalizeHookIdentity(options);
+		return JSON.stringify([
+			sessionId,
+			normalizedCwd,
+			normalizeExplicitInterpreter(normalizedCwd, options.interpreter),
+			identity.agentId ?? null,
+			identity.sessionFile ?? null,
+		]);
 	},
 	createSession: session => ({ ...session, generation: 0 }),
 	startKernel,
@@ -446,6 +456,8 @@ async function invokePythonToolRequest(
 		sessionId: options.sessionId,
 		interpreter: options.interpreter,
 		kernelOwnerId: options.kernelOwnerId,
+		agentId: options.agentId,
+		sessionFile: options.sessionFile,
 	});
 	if (!kernel) throw new EvalKernelNotRunningError("Python");
 
@@ -454,6 +466,8 @@ async function invokePythonToolRequest(
 		sessionId: options.sessionId,
 		interpreter: options.interpreter,
 		kernelOwnerId: options.kernelOwnerId,
+		agentId: options.agentId,
+		sessionFile: options.sessionFile,
 		toolSession: options.toolSession,
 		signal: options.signal,
 	};

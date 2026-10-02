@@ -15,6 +15,7 @@ export interface SessionSnapshot {
 	sessionFile?: string;
 	/** Registry worker id for agent-hook bridges (`RIG_AGENT_ID`). */
 	agentId?: string;
+	suppressInheritedIdentity?: boolean;
 	/**
 	 * On-disk roots the helpers substitute for internal-URL schemes
 	 * (e.g. `{ local: "/…/artifacts/local" }`). Lets `read`/`write`

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -11,13 +11,14 @@ import type {
 	WorkerOutbound,
 } from "@oh-my-pi/pi-coding-agent/eval/js/worker-protocol";
 import { postmortem } from "@oh-my-pi/pi-utils";
+import { buildHookIdentityWorkerEnv } from "../../src/hook-identity-env";
 
 interface WorkerHarness {
 	send(message: WorkerInbound): void;
 	onMessage(handler: (message: WorkerOutbound) => void): () => void;
 }
 
-function createWorkerHarness(): WorkerHarness {
+function createWorkerHarness(mode: "inline" | "isolated" = "inline"): WorkerHarness {
 	const hostListeners = new Set<(message: WorkerOutbound) => void>();
 	const workerListeners = new Set<(message: WorkerInbound) => void>();
 	const transport: Transport = {
@@ -33,7 +34,7 @@ function createWorkerHarness(): WorkerHarness {
 		close: () => {},
 	};
 	new WorkerCore(transport, {
-		mode: "inline",
+		mode,
 		interceptUnhandledRejections: postmortem.interceptUnhandledRejections,
 	});
 	return {
@@ -64,9 +65,9 @@ function waitForMessage(
 }
 
 async function initializeWorker(harness: WorkerHarness, snapshot: SessionSnapshot): Promise<void> {
-	const ready = waitForMessage(harness, message => message.type === "ready");
+	const ready = waitForMessage(harness, message => message.type === "ready" || message.type === "init-failed");
 	harness.send({ type: "init", snapshot });
-	expect((await ready).type).toBe("ready");
+	expect(await ready).toEqual({ type: "ready" });
 }
 
 function installFatalCapture(): {
@@ -92,6 +93,25 @@ function installFatalCapture(): {
 }
 
 describe("WorkerCore", () => {
+	const identityKeys = [
+		"PI_SESSION_FILE",
+		"RIG_AGENT_ID",
+		"RIG_DETACHED_AGENT",
+		"OMP_INTERNAL_PARENT_PI_SESSION_FILE",
+		"OMP_INTERNAL_PARENT_RIG_AGENT_ID",
+	] as const;
+	let inheritedEnv: NodeJS.ProcessEnv;
+	beforeEach(() => {
+		inheritedEnv = { ...process.env };
+		for (const key of identityKeys) delete process.env[key];
+	});
+	afterEach(() => {
+		for (const key of identityKeys) {
+			const value = inheritedEnv[key];
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	});
 	it("reports same-realm cwd conflicts through the worker protocol", async () => {
 		const first = createWorkerHarness();
 		const second = createWorkerHarness();
@@ -105,6 +125,10 @@ describe("WorkerCore", () => {
 			entered: () => entered.resolve(),
 			wait: gate.promise,
 		};
+		const held = waitForMessage(
+			first,
+			message => message.type === "result" && message.runId === "hold-first-runtime",
+		);
 		try {
 			first.send({
 				type: "run",
@@ -135,10 +159,419 @@ describe("WorkerCore", () => {
 			});
 		} finally {
 			gate.resolve();
+			await held;
 			delete (globalThis as { __omp_worker_core_gate?: { entered(): void; wait: Promise<void> } })
 				.__omp_worker_core_gate;
 			first.send({ type: "close" });
 			second.send({ type: "close" });
+		}
+	});
+	it("rejects a differing effective identity before overlapping run mutation", async () => {
+		const harness = createWorkerHarness("isolated");
+		const cwd = process.cwd();
+		await initializeWorker(harness, {
+			cwd,
+			sessionId: "identity-overlap",
+			sessionFile: "/tmp/identity-a.jsonl",
+			agentId: "identity-a",
+			localRoots: {},
+		});
+		const gate = Promise.withResolvers<void>();
+		const entered = Promise.withResolvers<void>();
+		Reflect.set(globalThis, "__omp_worker_identity_gate", {
+			entered: () => entered.resolve(),
+			wait: gate.promise,
+		});
+		try {
+			const held = waitForMessage(
+				harness,
+				message => message.type === "result" && message.runId === "identity-hold",
+			);
+			harness.send({
+				type: "run",
+				runId: "identity-hold",
+				code: `globalThis.__omp_worker_identity_gate.entered(); await globalThis.__omp_worker_identity_gate.wait;
+					if (process.env.RIG_AGENT_ID !== "identity-a" || env("RIG_AGENT_ID") !== "identity-a" ||
+						process.env.PI_SESSION_FILE !== "/tmp/identity-a.jsonl" || env("PI_SESSION_FILE") !== "/tmp/identity-a.jsonl") {
+						throw new Error("active run identity changed");
+					}`,
+				filename: "[identity-hold].js",
+				snapshot: {
+					cwd,
+					sessionId: "identity-overlap",
+					sessionFile: "/tmp/identity-a.jsonl",
+					agentId: "identity-a",
+					localRoots: {},
+				},
+			});
+			await entered.promise;
+
+			const differing = waitForMessage(
+				harness,
+				message => message.type === "result" && message.runId === "identity-differing",
+			);
+			harness.send({
+				type: "run",
+				runId: "identity-differing",
+				code: "process.env.RIG_AGENT_ID;",
+				filename: "[identity-differing].js",
+				snapshot: {
+					cwd,
+					sessionId: "identity-overlap",
+					sessionFile: "/tmp/identity-b.jsonl",
+					agentId: "identity-b",
+					localRoots: {},
+				},
+			});
+			expect(await differing).toMatchObject({
+				type: "result",
+				runId: "identity-differing",
+				ok: false,
+				error: {
+					name: "ToolError",
+					message: "Cannot run JS eval with a different effective identity while another run is active",
+				},
+			});
+
+			expect(process.env.RIG_AGENT_ID).toBe("identity-a");
+			expect(process.env.PI_SESSION_FILE).toBe("/tmp/identity-a.jsonl");
+			const absent = waitForMessage(harness, message => message.type === "result" && message.runId === "absent");
+			harness.send({
+				type: "run",
+				runId: "absent",
+				code: "throw new Error('must not execute')",
+				filename: "[absent].js",
+				snapshot: { cwd, sessionId: "identity-overlap" },
+			});
+			expect(await absent).toMatchObject({
+				type: "result",
+				ok: false,
+				error: {
+					name: "ToolError",
+					message: "Cannot run JS eval with a different effective identity while another run is active",
+				},
+			});
+			const same = waitForMessage(harness, message => message.type === "result" && message.runId === "same");
+			harness.send({
+				type: "run",
+				runId: "same",
+				code: "1 + 1",
+				filename: "[same].js",
+				snapshot: {
+					cwd,
+					sessionId: "identity-overlap",
+					agentId: "identity-a",
+					sessionFile: "/tmp/identity-a.jsonl",
+				},
+			});
+			expect(await same).toMatchObject({ type: "result", ok: true });
+			const rejectedInit = waitForMessage(harness, message => message.type === "init-failed");
+			harness.send({ type: "init", snapshot: { cwd, sessionId: "identity-overlap", agentId: "identity-b" } });
+			expect(await rejectedInit).toMatchObject({ type: "init-failed", error: { name: "ToolError" } });
+			expect(process.env.RIG_AGENT_ID).toBe("identity-a");
+			expect(process.env.PI_SESSION_FILE).toBe("/tmp/identity-a.jsonl");
+			gate.resolve();
+			expect(await held).toMatchObject({ type: "result", ok: true });
+		} finally {
+			gate.resolve();
+			Reflect.deleteProperty(globalThis, "__omp_worker_identity_gate");
+			harness.send({ type: "close" });
+		}
+	});
+
+	it.each([false, true])("refreshes raw and helper identity sequentially with detached=%s", async detached => {
+		process.env.RIG_AGENT_ID = "untrusted-parent";
+		process.env.PI_SESSION_FILE = "/tmp/untrusted.jsonl";
+		if (detached) process.env.RIG_DETACHED_AGENT = "1";
+		const harness = createWorkerHarness("isolated");
+		const base = { cwd: process.cwd(), sessionId: "sequential-identity" };
+		try {
+			await initializeWorker(harness, base);
+			for (const identity of [
+				{ agentId: "identity-a", sessionFile: "/tmp/a.jsonl" },
+				{ agentId: "identity-b", sessionFile: "/tmp/b.jsonl" },
+				{ agentId: "Main", sessionFile: "/tmp/Main.jsonl" },
+				{},
+			]) {
+				const snapshot: SessionSnapshot = { ...base, ...identity };
+				const expectedAgent =
+					snapshot.agentId === "Main" ? null : (snapshot.agentId ?? (detached ? "untrusted-parent" : null));
+				const expectedSession =
+					snapshot.agentId === "Main"
+						? null
+						: (snapshot.sessionFile ?? (detached ? "/tmp/untrusted.jsonl" : null));
+				const result = waitForMessage(harness, message => message.type === "result");
+				harness.send({
+					type: "run",
+					runId: "sequential",
+					filename: "[sequential].js",
+					snapshot,
+					code: `if ((process.env.RIG_AGENT_ID ?? null) !== ${JSON.stringify(expectedAgent)} ||
+						(env("RIG_AGENT_ID") ?? null) !== ${JSON.stringify(expectedAgent)} ||
+						(process.env.PI_SESSION_FILE ?? null) !== ${JSON.stringify(expectedSession)} ||
+						(env("PI_SESSION_FILE") ?? null) !== ${JSON.stringify(expectedSession)}) {
+						throw new Error("identity mismatch");
+					}`,
+				});
+				expect(await result).toMatchObject({ type: "result", ok: true });
+			}
+		} finally {
+			harness.send({ type: "close" });
+		}
+	});
+
+	it.each(["1", "0"])("removes worker carriers from raw and child env with detached=%s", async detached => {
+		const explicit = { agentId: "explicit-agent", sessionFile: "/tmp/explicit.jsonl" };
+		Object.assign(
+			process.env,
+			buildHookIdentityWorkerEnv(
+				{
+					RIG_DETACHED_AGENT: detached,
+					RIG_AGENT_ID: "parent-agent",
+					PI_SESSION_FILE: "/tmp/parent.jsonl",
+				},
+				explicit,
+			),
+		);
+		// Even untrusted carriers must not remain visible to evaluated code or children.
+		process.env.OMP_INTERNAL_PARENT_PI_SESSION_FILE = "/tmp/parent.jsonl";
+		process.env.OMP_INTERNAL_PARENT_RIG_AGENT_ID = "parent-agent";
+		const harness = createWorkerHarness("isolated");
+		const base = { cwd: process.cwd(), sessionId: "carrier-cleanup" };
+		const readEnv = `JSON.stringify([
+			process.env.OMP_INTERNAL_PARENT_PI_SESSION_FILE ?? null,
+			process.env.OMP_INTERNAL_PARENT_RIG_AGENT_ID ?? null,
+			process.env.PI_SESSION_FILE ?? null,
+			process.env.RIG_AGENT_ID ?? null,
+			process.env.RIG_DETACHED_AGENT ?? null,
+		])`;
+		try {
+			expect(process.env.OMP_INTERNAL_PARENT_PI_SESSION_FILE).toBeUndefined();
+			expect(process.env.OMP_INTERNAL_PARENT_RIG_AGENT_ID).toBeUndefined();
+			await initializeWorker(harness, { ...base, ...explicit });
+			expect(process.env.OMP_INTERNAL_PARENT_PI_SESSION_FILE).toBeUndefined();
+			expect(process.env.OMP_INTERNAL_PARENT_RIG_AGENT_ID).toBeUndefined();
+			for (const identity of [explicit, {}]) {
+				const expected = JSON.stringify([
+					null,
+					null,
+					"sessionFile" in identity ? identity.sessionFile : detached === "1" ? "/tmp/parent.jsonl" : null,
+					"agentId" in identity ? identity.agentId : detached === "1" ? "parent-agent" : null,
+					detached,
+				]);
+				const result = waitForMessage(harness, message => message.type === "result");
+				harness.send({
+					type: "run",
+					runId: "carrier-check",
+					filename: "[carrier-check].js",
+					snapshot: { ...base, ...identity },
+					code: `const expected = ${JSON.stringify(expected)};
+						if (${readEnv} !== expected) throw new Error("raw worker env leaked carriers or lost identity");
+						const child = Bun.spawn([process.execPath, "-e", ${JSON.stringify(`process.stdout.write(${readEnv})`)}], {
+							stdout: "pipe", stderr: "pipe", env: { ...process.env },
+						});
+						const output = await new Response(child.stdout).text();
+						const stderr = await new Response(child.stderr).text();
+						const exitCode = await child.exited;
+						if (exitCode !== 0 || output !== expected) throw new Error("child env mismatch: " + JSON.stringify({ output, expected, stderr, exitCode }));`,
+				});
+				expect(await result).toMatchObject({ type: "result", ok: true });
+				expect(process.env.OMP_INTERNAL_PARENT_PI_SESSION_FILE).toBeUndefined();
+				expect(process.env.OMP_INTERNAL_PARENT_RIG_AGENT_ID).toBeUndefined();
+			}
+		} finally {
+			harness.send({ type: "close" });
+		}
+	});
+
+	it("allows inline execution with untrusted stale host markers but rejects explicit identity", async () => {
+		process.env.RIG_AGENT_ID = "stale-host-agent";
+		process.env.PI_SESSION_FILE = "   ";
+		process.env.RIG_DETACHED_AGENT = "0";
+		const hostEnv = { ...process.env };
+		const harness = createWorkerHarness();
+		const snapshot = { cwd: process.cwd(), sessionId: "inline-stale-host" };
+		try {
+			await initializeWorker(harness, snapshot);
+			const result = waitForMessage(harness, message => message.type === "result");
+			harness.send({ type: "run", runId: "stale-host", code: "1 + 1", filename: "[stale-host].js", snapshot });
+			expect(await result).toMatchObject({ type: "result", ok: true });
+			expect(process.env).toEqual(hostEnv);
+			const rejected = waitForMessage(harness, message => message.type === "result");
+			harness.send({
+				type: "run",
+				runId: "explicit-identity",
+				code: "1 + 1",
+				filename: "[explicit-identity].js",
+				snapshot: { ...snapshot, agentId: "native-agent" },
+			});
+			expect(await rejected).toMatchObject({ type: "result", ok: false, error: { name: "ToolError" } });
+			expect(process.env).toEqual(hostEnv);
+		} finally {
+			harness.send({ type: "close" });
+		}
+	});
+
+	it("suppresses host identity throughout poisoned retained-tool registry access", async () => {
+		process.env.RIG_AGENT_ID = "host-agent";
+		process.env.PI_SESSION_FILE = "/tmp/host.jsonl";
+		const harness = createWorkerHarness();
+		const snapshot = { cwd: process.cwd(), sessionId: "inline-poisoned-registry" };
+		const setup = waitForMessage(harness, message => message.type === "result" && message.runId === "poisoned-setup");
+		try {
+			await initializeWorker(harness, snapshot);
+			harness.send({
+				type: "run",
+				runId: "poisoned-setup",
+				code: `
+					const observations = [];
+					const capture = label => {
+						const observation = {
+							label,
+							processAgent: process.env.RIG_AGENT_ID ?? null,
+							processSession: process.env.PI_SESSION_FILE ?? null,
+							helperAgent: env("RIG_AGENT_ID") ?? null,
+							helperSession: env("PI_SESSION_FILE") ?? null,
+						};
+						observations.push(observation);
+						return observation;
+					};
+					const spec = {
+						get name() {
+							capture("describe-name");
+							return "poisoned";
+						},
+						get description() {
+							capture("describe-description");
+							return "poisoned";
+						},
+						get parameters() {
+							capture("describe-parameters");
+							return { type: "object" };
+						},
+						get fn() {
+							capture("dispatch-fn");
+							return () => {
+								capture("dispatch-callback");
+								return {
+									get marker() {
+										return capture("dispatch-clone");
+									},
+								};
+							};
+						},
+					};
+					let registry = new Map([["poisoned", spec]]);
+					registry[Symbol.iterator] = function* () {
+						capture("registry-iterator");
+						yield* Map.prototype[Symbol.iterator].call(this);
+					};
+					Object.defineProperty(globalThis, "__omp_tools__", {
+						configurable: true,
+						get() {
+							capture("registry-getter");
+							return registry;
+						},
+						set(value) {
+							for (const [name, tool] of value) registry.set(name, tool);
+						},
+					});
+					globalThis.__omp_poisoned_observations = observations;
+				`,
+				filename: "[poisoned-setup].js",
+				snapshot,
+			});
+			expect(await setup).toMatchObject({ type: "result", runId: "poisoned-setup", ok: true });
+
+			const described = waitForMessage(
+				harness,
+				message => message.type === "result" && message.runId === "poisoned-describe",
+			);
+			harness.send({
+				type: "tool",
+				runId: "poisoned-describe",
+				op: "describe",
+				names: ["poisoned"],
+			});
+			expect(await described).toMatchObject({ type: "result", runId: "poisoned-describe", ok: true });
+
+			const called = waitForMessage(
+				harness,
+				message => message.type === "result" && message.runId === "poisoned-call",
+			);
+			harness.send({
+				type: "tool",
+				runId: "poisoned-call",
+				op: "call",
+				name: "poisoned",
+				args: {},
+			});
+			expect(await called).toMatchObject({ type: "result", runId: "poisoned-call", ok: true });
+
+			const observed = waitForMessage(
+				harness,
+				message =>
+					message.type === "display" && message.runId === "poisoned-observed" && message.output.type === "json",
+			);
+			const result = waitForMessage(
+				harness,
+				message => message.type === "result" && message.runId === "poisoned-observed",
+			);
+			harness.send({
+				type: "run",
+				runId: "poisoned-observed",
+				code: "display(globalThis.__omp_poisoned_observations)",
+				filename: "[poisoned-observed].js",
+				snapshot,
+			});
+			expect(await result).toMatchObject({ type: "result", runId: "poisoned-observed", ok: true });
+			const output = await observed;
+			if (output.type !== "display" || output.output.type !== "json")
+				throw new Error("missing poisoned observations");
+			const observations = output.output.data;
+			expect(Array.isArray(observations)).toBe(true);
+			expect((observations as Array<Record<string, unknown>>).length).toBeGreaterThan(0);
+			expect(
+				(observations as Array<Record<string, unknown>>).every(
+					observation =>
+						observation.processAgent === null &&
+						observation.processSession === null &&
+						observation.helperAgent === null &&
+						observation.helperSession === null,
+				),
+			).toBe(true);
+			expect((observations as Array<Record<string, unknown>>).map(observation => observation.label)).toEqual(
+				expect.arrayContaining([
+					"registry-getter",
+					"registry-iterator",
+					"describe-name",
+					"describe-description",
+					"describe-parameters",
+					"dispatch-fn",
+					"dispatch-callback",
+					"dispatch-clone",
+				]),
+			);
+		} finally {
+			harness.send({ type: "close" });
+		}
+	});
+
+	it("rejects identity-bearing inline init without changing host identity", async () => {
+		process.env.RIG_AGENT_ID = "host-agent";
+		process.env.OMP_INTERNAL_PARENT_PI_SESSION_FILE = "/tmp/host-parent.jsonl";
+		process.env.OMP_INTERNAL_PARENT_RIG_AGENT_ID = "host-parent";
+		const harness = createWorkerHarness();
+		try {
+			const result = waitForMessage(harness, message => message.type === "init-failed");
+			harness.send({ type: "init", snapshot: { cwd: process.cwd(), sessionId: "inline", agentId: "child-agent" } });
+			expect(await result).toMatchObject({ type: "init-failed", error: { name: "ToolError" } });
+			expect(process.env.RIG_AGENT_ID).toBe("host-agent");
+			expect(process.env.OMP_INTERNAL_PARENT_PI_SESSION_FILE).toBe("/tmp/host-parent.jsonl");
+			expect(process.env.OMP_INTERNAL_PARENT_RIG_AGENT_ID).toBe("host-parent");
+			expect(process.env.PI_SESSION_FILE).toBeUndefined();
+		} finally {
+			harness.send({ type: "close" });
 		}
 	});
 

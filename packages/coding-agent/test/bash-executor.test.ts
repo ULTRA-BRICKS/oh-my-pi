@@ -1481,6 +1481,40 @@ describe("applyDirenvPreflight direnv-load clamp", () => {
 		if (fs.existsSync(tempDir)) removeSyncWithRetries(tempDir);
 	});
 
+	it.each([true, false])(
+		"preserves caller overrides and safely removes direnv keys for POSIX=%s",
+		async posixShell => {
+			vi.spyOn(direnvModule, "loadDirenvEnv").mockResolvedValue({
+				set: {
+					CUSTOM: "direnv",
+					DIRENV_SET: "loaded",
+					RIG_AGENT_ID: "HostileDirenv",
+					PI_SESSION_FILE: "/tmp/hostile.jsonl",
+				},
+				unset: ["AWS_PROFILE", "CUSTOM", "BAD;NAME", "RIG_AGENT_ID", "PI_SESSION_FILE"],
+			});
+			const commandPrologue = posixShell
+				? "unset -v RIG_AGENT_ID PI_SESSION_FILE; export RIG_AGENT_ID='TrustedChild'; "
+				: "";
+			const result = await applyDirenvPreflight("echo ready", tempDir, {
+				direnvSetting: "auto",
+				posixShell,
+				direnvExcludedEnvKeys: ["RIG_AGENT_ID", "PI_SESSION_FILE"],
+				commandPrologue,
+				callerEnv: { CUSTOM: "keep" },
+				commandPrefix: "wrapper",
+			});
+			expect(result.command).toBe(
+				posixShell ? `unset -v AWS_PROFILE; ${commandPrologue}wrapper echo ready` : "wrapper echo ready",
+			);
+			expect(result.env).toEqual(
+				posixShell
+					? { CUSTOM: "keep", DIRENV_SET: "loaded" }
+					: { CUSTOM: "keep", DIRENV_SET: "loaded", AWS_PROFILE: "" },
+			);
+		},
+	);
+
 	it("clamps the direnv load to a positive caller timeout below the full budget", async () => {
 		// The clamp lives INSIDE the helper, so every backend that routes through
 		// applyDirenvPreflight (executeBash, ACP terminal, PTY) inherits it. A

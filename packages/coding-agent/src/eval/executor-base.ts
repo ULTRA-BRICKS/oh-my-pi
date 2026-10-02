@@ -1,6 +1,6 @@
 import { logger } from "@oh-my-pi/pi-utils";
 import { Settings } from "../config/settings";
-import { mergeHookIdentityEnv } from "../hook-identity-env";
+import { mergeHookIdentityEnv, normalizeHookIdentity } from "../hook-identity-env";
 import { OutputSink } from "../session/streaming-output";
 import type { ToolSession } from "../tools";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../tools/output-meta";
@@ -308,10 +308,11 @@ export function buildManagedKernelEnvPatch(
 	policy?: ManagedKernelEnvPolicy,
 ): KernelEnvPatch {
 	const localRoots = options.localRoots;
+	const identity = normalizeHookIdentity(options);
 	if (policy?.sparse) {
 		const patch: Record<string, string | undefined> = {};
-		if (options.sessionFile) patch.PI_SESSION_FILE = options.sessionFile;
-		if (options.agentId) patch.RIG_AGENT_ID = options.agentId;
+		if (identity.sessionFile) patch.PI_SESSION_FILE = identity.sessionFile;
+		if (identity.agentId) patch.RIG_AGENT_ID = identity.agentId;
 		if (options.artifactsDir) patch.PI_ARTIFACTS_DIR = options.artifactsDir;
 		if (options.bridge) {
 			patch.PI_TOOL_BRIDGE_URL = options.bridge.url;
@@ -322,8 +323,8 @@ export function buildManagedKernelEnvPatch(
 		return patch;
 	}
 	return {
-		PI_SESSION_FILE: options.sessionFile ?? null,
-		RIG_AGENT_ID: options.agentId ?? null,
+		PI_SESSION_FILE: identity.sessionFile ?? null,
+		RIG_AGENT_ID: identity.agentId ?? null,
 		PI_ARTIFACTS_DIR: options.artifactsDir ?? null,
 		PI_TOOL_BRIDGE_URL: options.bridge?.url ?? null,
 		PI_TOOL_BRIDGE_TOKEN: options.bridge?.token ?? null,

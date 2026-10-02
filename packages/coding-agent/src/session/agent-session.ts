@@ -153,6 +153,7 @@ import { normalizeToolEventInput, resolveToolEventInput } from "../extensibility
 import { GoalRuntime } from "../goals/runtime";
 import type { GoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
+import { normalizeHookIdentity } from "../hook-identity-env";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import type { IrcMessage } from "../irc/bus";
 import type { DaemonCompletionNotification } from "../launch/protocol";
@@ -1250,6 +1251,7 @@ export class AgentSession {
 			agent: this.agent,
 			sessionManager: this.sessionManager,
 			settings: this.settings,
+			getAgentId: () => normalizeHookIdentity({ agentId: this.getAgentId() }).agentId ?? null,
 			extensionRunner: () => this.#extensionRunner,
 			isStreaming: () => this.isStreaming,
 			appendSessionMessage: message => {
@@ -6662,6 +6664,8 @@ export class AgentSession {
 			hasUI: false,
 			cwd: this.sessionManager.getCwd(),
 			sessionManager: this.sessionManager,
+			getSessionFile: () => this.sessionManager.getSessionFile() ?? null,
+			getAgentId: () => normalizeHookIdentity({ agentId: this.getAgentId() }).agentId ?? null,
 			modelRegistry: this.#modelRegistry,
 			isProjectTrusted: () => true,
 

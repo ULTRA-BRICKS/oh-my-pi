@@ -1,5 +1,12 @@
 import { logger, postmortem, Snowflake, workerHostEntry } from "@oh-my-pi/pi-utils";
 import {
+	buildHookIdentityWorkerEnv,
+	detachedParentHookIdentity,
+	hasHookIdentity,
+	type HookIdentityEnvInput,
+	resolveHookIdentity,
+} from "../../hook-identity-env";
+import {
 	createWorkerHandle,
 	createWorkerSubprocess,
 	resolveWorkerSpawnCmd,
@@ -16,11 +23,10 @@ import {
 	resolveOwnerScopedSessionKey,
 	type SessionOwners,
 } from "../executor-base";
-import { mergeHookIdentityEnv } from "../../hook-identity-env";
 import { shouldDetachKernel } from "../py/spawn-options";
 import type { EvalToolDescriptor, EvalToolInvokeResult } from "../types";
 import { callSessionTool, type JsStatusEvent } from "./tool-bridge";
-import { WorkerCore } from "./worker-core";
+import { INLINE_IDENTITY_FALLBACK_ERROR, WorkerCore } from "./worker-core";
 // Coding-agent binary/bundle workers route through the CLI entrypoint with a
 // hidden argv mode, so compiled/npm builds only need one JavaScript entry.
 import type {
@@ -144,6 +150,7 @@ export async function executeInVmContext(options: {
 	localRoots?: Record<string, string>;
 	sessionFile?: string;
 	agentId?: string;
+	suppressInheritedIdentity?: boolean;
 	reset?: boolean;
 	code: string;
 	filename: string;
@@ -189,6 +196,7 @@ export async function executeInVmContext(options: {
 			localRoots: options.localRoots,
 			sessionFile: options.sessionFile,
 			agentId: options.agentId,
+			suppressInheritedIdentity: options.suppressInheritedIdentity,
 		},
 		options.timeoutMs,
 		options.ownerId,
@@ -391,6 +399,7 @@ async function runOnce(
 		localRoots?: Record<string, string>;
 		sessionFile?: string;
 		agentId?: string;
+		suppressInheritedIdentity?: boolean;
 		code: string;
 		filename: string;
 		runState: VmRunState;
@@ -450,6 +459,7 @@ async function runOnce(
 				localRoots: options.localRoots,
 				sessionFile: options.sessionFile,
 				agentId: options.agentId,
+				suppressInheritedIdentity: options.suppressInheritedIdentity,
 				preludes: javascriptPreludeSources(options.session),
 			},
 		});
@@ -484,7 +494,7 @@ async function acquireSession(
 	const startup = (async (): Promise<JsSession> => {
 		// Attach the message listener before sending init. Both Bun Worker messages
 		// and subprocess IPC can arrive immediately after the evaluator loads.
-		const worker = spawnJsWorker({ sessionFile: snapshot.sessionFile, agentId: snapshot.agentId });
+		const worker = spawnJsWorker(snapshot);
 		const session: JsSession = {
 			sessionKey,
 			sessionId: snapshot.sessionId,
@@ -505,7 +515,7 @@ async function acquireSession(
 			} catch (error) {
 				// Runtime crash/load failures surface asynchronously via the runtime's
 				// error callback, after the synchronous spawn try/catch has returned.
-				// Preserve the full process -> Worker -> inline ladder for those failures.
+				// Preserve the process -> Worker -> inline ladder where identity permits inline.
 				const failed = session.worker;
 				await failed.terminate().catch(() => undefined);
 				if (failed.mode === "inline") throw error;
@@ -513,11 +523,16 @@ async function acquireSession(
 					logger.warn("JS eval subprocess init failed; retrying with a Bun Worker", {
 						error: error instanceof Error ? error.message : String(error),
 					});
-					session.worker = spawnBunWorker();
+					session.worker = spawnBunWorker({
+						sessionFile: snapshot.sessionFile,
+						agentId: snapshot.agentId,
+						suppressInheritedIdentity: snapshot.suppressInheritedIdentity,
+					});
 				} else {
-					logger.warn("JS eval worker init failed; retrying with inline worker (no sync-loop guard)", {
+					logger.warn("JS eval worker init failed; evaluating inline fallback eligibility", {
 						error: error instanceof Error ? error.message : String(error),
 					});
+					if (hasJsWorkerIdentity(snapshot)) throw new ToolError(INLINE_IDENTITY_FALLBACK_ERROR);
 					session.worker = spawnInlineWorker();
 				}
 				session.state = "alive";
@@ -792,16 +807,15 @@ async function raceWithTimeout<T>(promise: Promise<T>, timeoutMs: number, reason
 	}
 }
 
-function jsWorkerSpawnEnv(identity?: { sessionFile?: string; agentId?: string }): Record<string, string> {
-	return (
-		mergeHookIdentityEnv(workerEnvFromParent(), {
-			sessionFile: identity?.sessionFile,
-			agentId: identity?.agentId,
-		}) ?? workerEnvFromParent()
-	);
+function hasJsWorkerIdentity(identity?: HookIdentityEnvInput): boolean {
+	return hasHookIdentity(resolveHookIdentity(identity, detachedParentHookIdentity(process.env)));
 }
 
-function spawnJsWorker(identity?: { sessionFile?: string; agentId?: string }): WorkerHandle {
+function jsWorkerSpawnEnv(identity?: HookIdentityEnvInput): Record<string, string> {
+	return buildHookIdentityWorkerEnv(workerEnvFromParent(), identity);
+}
+
+function spawnJsWorker(identity?: HookIdentityEnvInput): WorkerHandle {
 	if (!useWorkerThreadForTests) {
 		try {
 			return spawnJsProcess(identity);
@@ -814,25 +828,38 @@ function spawnJsWorker(identity?: { sessionFile?: string; agentId?: string }): W
 			});
 		}
 	}
-	return spawnBunWorker();
+	return spawnBunWorker(identity);
 }
 
-function spawnBunWorker(): WorkerHandle {
+function spawnBunWorker(identity?: HookIdentityEnvInput): WorkerHandle {
 	try {
 		const hostEntry = workerHostEntry();
 		const worker = hostEntry
-			? new Worker(hostEntry, { type: "module", argv: ["__omp_worker_js_eval"] })
-			: new Worker(new URL("./worker-entry.ts", import.meta.url).href, { type: "module" });
+			? new Worker(hostEntry, {
+					type: "module",
+					argv: ["__omp_worker_js_eval"],
+					env: jsWorkerSpawnEnv(identity),
+				})
+			: new Worker(new URL("./worker-entry.ts", import.meta.url).href, {
+					type: "module",
+					env: jsWorkerSpawnEnv(identity),
+				});
 		return wrapBunWorker(worker);
 	} catch (err) {
-		logger.warn("Bun Worker spawn failed; using inline JS eval worker (no sync-loop guard)", {
+		logger.warn("Bun Worker spawn failed; evaluating inline fallback eligibility", {
 			error: err instanceof Error ? err.message : String(err),
 		});
+		// Inline workers share the host realm, so any managed marker would be
+		// visible to child spawns but cannot be safely replaced without mutating
+		// the host process environment.
+		if (hasJsWorkerIdentity(identity)) {
+			throw new ToolError(INLINE_IDENTITY_FALLBACK_ERROR);
+		}
 		return spawnInlineWorker();
 	}
 }
 
-function spawnJsProcess(identity?: { sessionFile?: string; agentId?: string }): WorkerHandle {
+function spawnJsProcess(identity?: HookIdentityEnvInput): WorkerHandle {
 	const spawned = createWorkerSubprocess<WorkerOutbound>({
 		spawnCommand: resolveWorkerSpawnCmd(JS_EVAL_PROCESS_ARG),
 		env: jsWorkerSpawnEnv(identity),

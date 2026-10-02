@@ -7,7 +7,7 @@ import { ExponentialYield } from "@oh-my-pi/pi-agent-core/utils/yield";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { type MinimizerOptions, PtySession, Shell, type ShellRunResult } from "@oh-my-pi/pi-natives";
 import { $env } from "@oh-my-pi/pi-utils/env";
-import { isCmdShell, isExecutable, type ShellConfig } from "@oh-my-pi/pi-utils/procmgr";
+import { isCmdShell, isExecutable, isPosixShell, type ShellConfig } from "@oh-my-pi/pi-utils/procmgr";
 import { Settings, type ShellMinimizerSettings } from "../config/settings";
 import { OutputSink, type OutputSummary } from "../session/streaming-output";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../tools/output-meta";
@@ -17,6 +17,10 @@ import { loadDirenvEnv } from "./direnv";
 import { buildNonInteractiveEnv } from "./non-interactive-env";
 
 export interface BashExecutorOptions {
+	/** Trusted shell setup, executed after startup and before the prefixed user command. */
+	commandPrologue?: string;
+	/** Keys owned by trusted setup rather than repository-provided environment. */
+	direnvExcludedEnvKeys?: readonly string[];
 	cwd?: string;
 	/** Milliseconds before aborting the command; 0 disables the executor deadline. */
 	timeout?: number;
@@ -78,6 +82,12 @@ export interface BashResult {
 const SAFE_ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 export interface DirenvPreflightOptions {
+	/** Trusted setup kept outside the configured user-command wrapper. */
+	commandPrologue?: string;
+	/** Keys owned by trusted setup rather than repository-provided environment. */
+	direnvExcludedEnvKeys?: readonly string[];
+	/** Whether the command accepts POSIX unset syntax; defaults to the embedded shell. */
+	posixShell?: boolean;
 	/** Caller-supplied env overlay; these values win over direnv-provided ones. */
 	callerEnv?: Record<string, string>;
 	signal?: AbortSignal;
@@ -95,8 +105,7 @@ export interface DirenvPreflightOptions {
 	/** `bash.direnv` setting — `"off"` skips the load entirely. */
 	direnvSetting: "auto" | "off";
 	/** Shell wrapper prefix (profiler/strace) to place *after* the unset prefix,
-	 *  matching `executeBash`'s ordering. Backends that apply their own shell
-	 *  wrapping (ACP `wrapShellLineForClientTerminal`) omit this. */
+	 *  matching `executeBash`'s ordering. */
 	commandPrefix?: string | undefined;
 }
 
@@ -106,6 +115,7 @@ export interface DirenvPreflightOptions {
  * the same devenv tools. Encapsulates: load the diff, merge `set` under the
  * caller's overlay (caller wins), and prepend a regex-gated `unset -v` for
  * variables the `.envrc` removes (skipping any the caller re-supplied).
+ * Non-POSIX shells receive empty env overrides instead of shell syntax.
  *
  * Returns the possibly-prefixed command plus the merged env, or the inputs
  * unchanged (`env` = `callerEnv`) when direnv is off, absent, or has no `.envrc`.
@@ -117,7 +127,7 @@ export async function applyDirenvPreflight(
 	cwd: string,
 	opts: DirenvPreflightOptions,
 ): Promise<{ command: string; env: Record<string, string> | undefined }> {
-	const withPrefix = (line: string): string => (opts.commandPrefix ? `${opts.commandPrefix} ${line}` : line);
+	const preparedCommand = `${opts.commandPrologue ?? ""}${opts.commandPrefix ? `${opts.commandPrefix} ` : ""}${command}`;
 	// A positive caller deadline clamps the direnv load below its full budget so
 	// a cold `.envrc` can't outlast a short-timeout command; `0`/undefined means
 	// "no caller clamp" (a disabled command deadline is not a 0 ms load). Every
@@ -129,19 +139,29 @@ export async function applyDirenvPreflight(
 	const direnvDiff =
 		opts.direnvSetting === "off" ? null : await loadDirenvEnv(cwd, { timeoutMs: loadTimeoutMs, signal: opts.signal });
 	if (!direnvDiff) {
-		return { command: withPrefix(command), env: opts.callerEnv };
+		return { command: preparedCommand, env: opts.callerEnv };
 	}
 	// The caller's explicit env still wins over direnv-provided values.
-	const mergedEnv = { ...direnvDiff.set, ...opts.callerEnv };
+	// A command-scope direnv binding would make the prologue unset reveal an
+	// inherited value in the embedded shell. Keep trusted keys out of that scope.
+	const direnvEnv = { ...direnvDiff.set };
+	for (const key of opts.direnvExcludedEnvKeys ?? []) delete direnvEnv[key];
+	const mergedEnv = { ...direnvEnv, ...opts.callerEnv };
 	// direnv can also *remove* inherited variables (a `.envrc` doing
-	// `unset AWS_PROFILE`). An env overlay can only add/override, so prepend a
-	// real `unset` for those — unless the caller re-supplied the same var
-	// explicitly, in which case the caller wins.
+	// `unset AWS_PROFILE`). Preserve caller overrides and omit unsafe names.
+	// POSIX shells can remove variables; other shells only get empty overrides.
 	const direnvUnsets = direnvDiff.unset.filter(
-		name => !(opts.callerEnv && name in opts.callerEnv) && SAFE_ENV_NAME.test(name),
+		name =>
+			!opts.direnvExcludedEnvKeys?.includes(name) &&
+			!(opts.callerEnv && name in opts.callerEnv) &&
+			SAFE_ENV_NAME.test(name),
 	);
+	if (opts.posixShell === false) {
+		for (const name of direnvUnsets) mergedEnv[name] = "";
+		return { command: preparedCommand, env: mergedEnv };
+	}
 	const unsetPrefix = direnvUnsets.length > 0 ? `unset -v ${direnvUnsets.join(" ")}; ` : "";
-	return { command: `${unsetPrefix}${withPrefix(command)}`, env: mergedEnv };
+	return { command: `${unsetPrefix}${preparedCommand}`, env: mergedEnv };
 }
 
 const shellSessions = new Map<string, Shell>();
@@ -488,22 +508,23 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	// signal + timeout so an aborted / short-timeout call can't hang on a cold
 	// `.envrc` load before the abort listener is installed. The helper applies
 	// the configured shell `prefix` after any `unset -v` it prepends.
+	const runCdInPersistentShell = options?.useUserShell === true && !prefix && isPersistentShellCdCommand(command);
+	const useUserShell = options?.useUserShell === true && !bashShell && !isCmdShell(shell) && !runCdInPersistentShell;
 	const preflight = await applyDirenvPreflight(command, commandCwd ?? process.cwd(), {
+		posixShell: !(usePty || useUserShell) || isPosixShell(shell),
 		callerEnv: options?.env,
 		signal: options?.signal,
 		timeoutMs: settings.get("bash.direnvLoadTimeoutMs"),
 		callerTimeoutMs: options?.timeout,
 		direnvSetting: settings.get("bash.direnv"),
 		commandPrefix: prefix,
+		commandPrologue: options?.commandPrologue,
+		direnvExcludedEnvKeys: options?.direnvExcludedEnvKeys,
 	});
 	const commandEnv = buildNonInteractiveEnv(preflight.env);
-	const runCdInPersistentShell = options?.useUserShell === true && !prefix && isPersistentShellCdCommand(command);
 	// Never wrap in cmd.exe: it is only the Windows no-bash fallback for spawn
 	// paths, and the embedded brush shell runs the POSIX line better directly.
-	const finalCommand =
-		options?.useUserShell === true && !bashShell && !isCmdShell(shell) && !runCdInPersistentShell
-			? buildUserShellCommand(shell, args, preflight.command)
-			: preflight.command;
+	const finalCommand = useUserShell ? buildUserShellCommand(shell, args, preflight.command) : preflight.command;
 
 	// Create output sink for truncation and artifact handling
 	const graphics = new TerminalGraphicsDecoder();

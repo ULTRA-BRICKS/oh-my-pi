@@ -1,3 +1,5 @@
+import { type HookIdentityEnvInput, normalizeHookIdentity } from "../../hook-identity-env";
+import { MAIN_AGENT_ID } from "../../registry/agent-registry";
 import type { ToolSession } from "../../tools";
 import {
 	type ExecutorBackend,
@@ -16,15 +18,30 @@ export function namespaceSessionId(sessionId: string): string {
 }
 
 /** Resolve the retained JavaScript kernel identity owned by a tool session. */
-export function resolveJsKernelIdentity(session: ToolSession): {
+export function resolveJsKernelIdentity(
+	session: ToolSession,
+	overrides?: HookIdentityEnvInput,
+): {
 	sessionKey: string;
 	ownerId: string | undefined;
 	agentId: string | undefined;
+	sessionFile: string | undefined;
+	suppressInheritedIdentity: boolean;
 } {
+	const rawAgentId = overrides?.agentId ?? session.getAgentId?.();
+	const suppressInheritedIdentity = rawAgentId?.trim() === MAIN_AGENT_ID;
+	const sessionFile = overrides?.sessionFile ?? session.getSessionFile?.() ?? undefined;
+	const identity = normalizeHookIdentity({ agentId: rawAgentId, sessionFile });
 	return {
-		sessionKey: namespaceSessionId(session.getEvalSessionId?.() ?? defaultEvalSessionId(session)),
+		sessionKey: JSON.stringify([
+			namespaceSessionId(session.getEvalSessionId?.() ?? defaultEvalSessionId(session)),
+			identity.agentId ?? null,
+			identity.sessionFile ?? null,
+		]),
 		ownerId: session.getEvalKernelOwnerId?.() ?? undefined,
-		agentId: session.getAgentId?.() ?? undefined,
+		agentId: identity.agentId,
+		sessionFile: identity.sessionFile,
+		suppressInheritedIdentity,
 	};
 }
 
@@ -38,15 +55,16 @@ export default {
 	},
 
 	async execute(code: string, opts: ExecutorBackendExecOptions): Promise<ExecutorBackendResult> {
-		const identity = resolveJsKernelIdentity(opts.session);
+		const identity = resolveJsKernelIdentity(opts.session, opts);
 		const result = await executeJs(code, {
 			cwd: opts.cwd,
 			idleTimeoutMs: opts.idleTimeoutMs,
 			signal: opts.signal,
 			sessionId: identity.sessionKey,
 			kernelOwnerId: identity.ownerId,
-			sessionFile: opts.sessionFile,
-			agentId: opts.agentId ?? identity.agentId,
+			sessionFile: identity.sessionFile,
+			agentId: identity.agentId,
+			suppressInheritedIdentity: identity.suppressInheritedIdentity,
 			reset: opts.reset,
 			onChunk: opts.onChunk,
 			onStatus: opts.onStatus,

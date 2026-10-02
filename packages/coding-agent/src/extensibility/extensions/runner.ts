@@ -14,6 +14,7 @@ import type { KeyId } from "@oh-my-pi/pi-tui";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../../config/model-registry";
 import { type Settings, withActiveSettings } from "../../config/settings";
+import { normalizeHookIdentity, withHookIdentity } from "../../hook-identity-env";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import { type Theme, theme } from "../../modes/theme/theme";
@@ -1194,7 +1195,7 @@ export class ExtensionRunner {
 			setTimeout: (callback, ms, ...args) => this.#managedTimers.setTimeout(callback, ms, ...args),
 			clearTimer: timer => this.#managedTimers.clear(timer),
 			getSessionFile: () => this.sessionManager.getSessionFile() ?? null,
-			getAgentId: () => this.getAgentIdFn?.() ?? null,
+			getAgentId: () => normalizeHookIdentity({ agentId: this.getAgentIdFn?.() }).agentId ?? null,
 			invokeTool:
 				delegation !== undefined && this.hasNativeTool(delegation.toolName)
 					? (params, options) =>
@@ -1293,9 +1294,17 @@ export class ExtensionRunner {
 						let result: R | undefined;
 						try {
 							result = await this.#toolRegistrationScope.run(registrationScope, () =>
-								handler(
-									event,
-									createHandlerContext(ctx, handlerSignal, event.type === "tool_call" ? budget : undefined),
+								withHookIdentity(
+									{ sessionFile: this.sessionManager.getSessionFile(), agentId: this.getAgentIdFn?.() },
+									() =>
+										handler(
+											event,
+											createHandlerContext(
+												ctx,
+												handlerSignal,
+												event.type === "tool_call" ? budget : undefined,
+											),
+										),
 								),
 							);
 						} catch (error) {
