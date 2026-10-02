@@ -1,0 +1,23 @@
+HYP-1441 ticket creation handoff
+
+Status: blocked by task-cli GitHub backend permissions; no issue URL/ID was created.
+
+Worktree: /Users/ultra/xp/oh-my-pi/.worktrees/hyp-1441-sigpipe
+Created with: rig worktree create -C /Users/ultra/xp/oh-my-pi hyp-1441-sigpipe --branch task/hyp-1441-sigpipe
+
+Attempts:
+- task find 'HYP-1441' --repo can1357/oh-my-pi --no-pager -> (no tickets)
+- task find 'HYP-1441' --repo hyperide/hyper-saas --no-pager -> (no tickets)
+- task find 'HYP-1441' in default repos -> HTTP 422 for inaccessible alex-mextner repos
+- task new against can1357/oh-my-pi passed policy after --skip-links, but POST failed HTTP 403: You do not have permission to create labels on this repository.
+- Retrying without explicit labels failed identically because task-cli always adds default/session/status labels.
+
+Exact evidence to enter:
+Reproduction: from a linked worktree with SHIP_MAIN_CHECKOUT unset, run gh ship <PR>; it exits 141 before the merge gate completes. agent-tools/ci/ship/ship.sh:293 enables set -euo pipefail. At :578, MAIN_CHECKOUT defaults through `git worktree list --porcelain | awk '/^worktree /{print $2; exit}'`. awk exits after the first worktree; the still-writing git producer receives SIGPIPE (141), and pipefail plus errexit aborts gh ship. rig-cli/riglib/gh_ship_alias.py:59-61 dispatches gh ship to .claude/scripts/pr-ship.sh, then the canonical ci/ship/ship.sh.
+
+Acceptance criteria:
+1. With SHIP_MAIN_CHECKOUT unset, automatic primary-checkout detection consumes git worktree output without SIGPIPE and gh ship does not exit 141 before normal ship gates run.
+2. The detected primary checkout remains the first worktree returned by git worktree list, and explicit SHIP_MAIN_CHECKOUT still takes precedence.
+3. A regression reproduction covers a linked-worktree invocation with multiple worktree records and asserts non-141 status while preserving the selected primary path.
+
+No HYP-1441 URL was found in oh-my-pi, agent-tools, task-cli, or rig-cli sources/history or task search. No source edits, commits, or pushes made.
